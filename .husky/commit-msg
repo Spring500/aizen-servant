@@ -1,0 +1,50 @@
+#!/bin/sh
+# commit-msg hook — 校验 AizenServant 提交规范
+# 规则见 AGENTS.md § 技术约定 > Git 提交
+
+COMMIT_MSG=$(cat "$1")
+FIRST_LINE=$(echo "$COMMIT_MSG" | head -n1)
+
+# ── 校验首行格式: <type>: <简述> ──
+TYPE=$(echo "$FIRST_LINE" | sed -n 's/^\([a-z]*\): .*/\1/p')
+
+if [ -z "$TYPE" ]; then
+  echo "❌ 提交首行格式错误"
+  echo ""
+  echo "  要求: <type>: <中文简述>"
+  echo "  示例: feat: 新增记忆块存储层"
+  echo "        fix: 修复向量搜索泄漏"
+  echo ""
+  echo "  type: feat | fix | refactor | test | docs | chore"
+  echo ""
+  echo "  你的提交:"
+  echo "  $FIRST_LINE"
+  exit 1
+fi
+
+# ── 校验 type 是否在允许表中 ──
+case "$TYPE" in
+  feat|fix|refactor|test|docs|chore) ;;
+  *)
+    echo "❌ 无效的提交 type: '$TYPE'"
+    echo ""
+    echo "  允许: feat | fix | refactor | test | docs | chore"
+    echo ""
+    echo "  你的提交:"
+    echo "  $FIRST_LINE"
+    exit 1
+    ;;
+esac
+
+# ── 校验简述不为空 ──
+DESC=$(echo "$FIRST_LINE" | sed "s/^$TYPE: //" | sed 's/[[:space:]]*$//')
+if [ -z "$DESC" ]; then
+  echo "❌ type 后的描述不能为空"
+  echo ""
+  echo "  你的提交:"
+  echo "  $FIRST_LINE"
+  exit 1
+fi
+
+echo "✅ 提交格式：$TYPE"
+exit 0
