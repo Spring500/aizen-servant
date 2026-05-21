@@ -64,7 +64,7 @@ async function main(): Promise<void> {
     });
 
     block.summary = {
-      self: firstLine.slice(0, 100).trim(),
+      self: title.replace(/^#+\s*/, '').slice(0, 100).trim(),
       prev: null,
       next: null,
     };
@@ -96,7 +96,7 @@ function splitByAdrHeader(md: string): { title: string; content: string }[] {
   let started = false;
 
   for (const line of lines) {
-    if (/^## ADR-/.test(line)) {
+    if (/^## ADR-/.test(line) || /^### ADR-/.test(line)) {
       if (started) {
         sections.push({ title: currentTitle, content: currentContent.join('\n').trim() });
       }

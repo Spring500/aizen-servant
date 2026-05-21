@@ -32,8 +32,8 @@ export class OllamaEmbedder implements Embedder {
       throw new Error(`Embedding API 错误: ${response.status} ${body}`);
     }
 
-    const data = (await response.json()) as { embeddings: number[][] };
-    const raw = data.embeddings[0];
+    const data = (await response.json()) as { embedding?: number[]; embeddings?: number[][] };
+    const raw = data.embedding ?? data.embeddings?.[0];
     if (!raw || raw.length !== 768) {
       throw new Error(`Embedding API 返回了非预期的维度: ${raw?.length}`);
     }
