@@ -1,9 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { BlockStore } from '../../src/memory/store.js';
-import { createBlock } from '../../src/memory/block.js';
 
 let testDir: string;
 let store: BlockStore;
@@ -24,11 +23,10 @@ describe('BlockStore', () => {
   });
 
   it('append 写入 JSON 文件和 .vec', async () => {
-    const block = createBlock({ type: 'document', content: 'hello' });
     const emb = new Float32Array(768).fill(0.1);
-    await store.append(block, emb);
+    const { blockId } = await store.append({ type: 'document', content: 'hello' }, emb);
 
-    const jsonPath = join(testDir, 'blocks', `${block.blockId}.json`);
+    const jsonPath = join(testDir, 'blocks', `${blockId}.json`);
     expect(existsSync(jsonPath)).toBe(true);
 
     const vecPath = join(testDir, 'blocks.vec');
@@ -36,13 +34,12 @@ describe('BlockStore', () => {
   });
 
   it('getBlock 读取已写入的块', async () => {
-    const block = createBlock({ type: 'document', content: 'hello world' });
     const emb = new Float32Array(768).fill(0.1);
-    await store.append(block, emb);
+    const { blockId } = await store.append({ type: 'document', content: 'hello world' }, emb);
 
-    const loaded = store.getBlock(block.blockId);
+    const loaded = store.getBlock(blockId);
     expect(loaded).not.toBeNull();
-    expect(loaded!.blockId).toBe(block.blockId);
+    expect(loaded!.blockId).toBe(blockId);
     expect(loaded!.content).toBe('hello world');
   });
 
@@ -51,11 +48,9 @@ describe('BlockStore', () => {
   });
 
   it('getAllBlocks 按文件名排序返回', async () => {
-    const a = createBlock({ type: 'document', content: 'a' });
-    const b = createBlock({ type: 'document', content: 'b' });
     const emb = new Float32Array(768);
-    await store.append(a, emb);
-    await store.append(b, emb);
+    await store.append({ type: 'document', content: 'a' }, emb);
+    await store.append({ type: 'document', content: 'b' }, emb);
 
     const blocks = store.getAllBlocks();
     expect(blocks.length).toBe(2);
@@ -65,11 +60,10 @@ describe('BlockStore', () => {
   });
 
   it('loadVectors 加载 .vec 文件', async () => {
-    const block = createBlock({ type: 'document', content: 'x' });
     const emb = new Float32Array(768);
     emb[0] = 0.42;
     emb[1] = 0.73;
-    await store.append(block, emb);
+    await store.append({ type: 'document', content: 'x' }, emb);
 
     const vec = store.loadVectors();
     expect(vec.length).toBe(768);
@@ -88,32 +82,81 @@ describe('BlockStore', () => {
   });
 
   it('needsRebuild updateHash 后为 false', async () => {
-    const block = createBlock({ type: 'document', content: 'x' });
-    await store.append(block, new Float32Array(768));
+    await store.append({ type: 'document', content: 'x' }, new Float32Array(768));
     store.updateHash();
     expect(store.needsRebuild()).toBe(false);
   });
 
   it('needsRebuild 新增文件后变为 true', async () => {
-    const block1 = createBlock({ type: 'document', content: 'x' });
-    await store.append(block1, new Float32Array(768));
+    await store.append({ type: 'document', content: 'x' }, new Float32Array(768));
     store.updateHash();
 
-    const block2 = createBlock({ type: 'document', content: 'y' });
-    await store.append(block2, new Float32Array(768));
+    await store.append({ type: 'document', content: 'y' }, new Float32Array(768));
 
     expect(store.needsRebuild()).toBe(true);
   });
 
   it('stats 返回正确的统计', async () => {
     const emb = new Float32Array(768).fill(0.1);
-    await store.append(createBlock({ type: 'document', content: 'a' }), emb);
-    await store.append(createBlock({ type: 'document', content: 'b' }), emb);
+    await store.append({ type: 'document', content: 'a' }, emb);
+    await store.append({ type: 'document', content: 'b' }, emb);
 
     expect(store.stats()).toEqual({
       blockCount: 2,
       indexedCount: 2,
       vecSizeBytes: 2 * 768 * 4,
     });
+  });
+
+  it('updateBlock 更新已有块的元数据', async () => {
+    const emb = new Float32Array(768).fill(0.1);
+    const { blockId } = await store.append({ type: 'document', content: '更新测试' }, emb);
+
+    store.updateBlock(blockId, {
+      relations: { prevId: null, nextId: '01J4XK7N8P9Q2R3S4T5V6W7X8', related: [] },
+      summary: { self: '自定义摘要', prev: null, next: null },
+    });
+
+    const loaded = store.getBlock(blockId);
+    expect(loaded!.relations.nextId).toBe('01J4XK7N8P9Q2R3S4T5V6W7X8');
+    expect(loaded!.summary.self).toBe('自定义摘要');
+    expect(loaded!.content).toBe('更新测试');
+  });
+
+  it('updateBlock 对不存在的 blockId 抛错', () => {
+    expect(() => store.updateBlock('nonexistent', {})).toThrow('未找到 block');
+  });
+});
+
+describe('BlockStore 去重', () => {
+  it('相同正文内容 append 两次只写入一个 JSON 文件', async () => {
+    const emb = new Float32Array(768).fill(0.1);
+
+    await store.append({ type: 'document', content: '完全相同的正文' }, emb);
+    await store.append({ type: 'document', content: '完全相同的正文' }, emb);
+
+    const jsonFiles = readdirSync(join(testDir, 'blocks')).filter(f => f.endsWith('.json'));
+    expect(jsonFiles.length).toBe(1);
+  });
+
+  it('相同正文 append 返回已存在的 blockId', async () => {
+    const emb = new Float32Array(768).fill(0.1);
+
+    const result1 = await store.append({ type: 'document', content: '去重测试正文' }, emb);
+    const result2 = await store.append({ type: 'document', content: '去重测试正文' }, emb);
+
+    expect(result1.isNew).toBe(true);
+    expect(result2.isNew).toBe(false);
+    expect(result2.blockId).toBe(result1.blockId);
+  });
+
+  it('不同正文内容 append 写入两个 JSON 文件', async () => {
+    const emb = new Float32Array(768).fill(0.1);
+
+    await store.append({ type: 'document', content: '正文 A' }, emb);
+    await store.append({ type: 'document', content: '正文 B' }, emb);
+
+    const jsonFiles = readdirSync(join(testDir, 'blocks')).filter(f => f.endsWith('.json'));
+    expect(jsonFiles.length).toBe(2);
   });
 });

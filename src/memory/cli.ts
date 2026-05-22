@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
 import { BlockStore } from './store.js';
-import { OllamaEmbedder } from './embedder.js';
 import { Retriever } from './retriever.js';
-import { createBlock } from './block.js';
+import { OllamaEmbedder } from './embedder.js';
 
+/**
+ * CLI 主入口。根据子命令分发到对应的处理函数。
+ *
+ * 子命令：add / get / search / stats / rebuild
+ */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length === 0) {
@@ -28,6 +32,13 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * 解析命令行参数中的 --key value 标志。
+ * 同一个 key 出现多次会收集为字符串数组。
+ *
+ * @param args - 原始参数数组（不含命令名本身）
+ * @returns 标志名到值的映射
+ */
 function parseFlags(args: string[]): Map<string, string | string[]> {
   const map = new Map<string, string | string[]>();
   let i = 0;
@@ -48,6 +59,14 @@ function parseFlags(args: string[]): Map<string, string | string[]> {
   return map;
 }
 
+/**
+ * 从标志 Map 中读取必填的字符串值。
+ * 缺失或类型不对时输出错误并退出。
+ *
+ * @param flags - parseFlags 的返回值
+ * @param name - 标志名（不含 -- 前缀）
+ * @returns 标志的字符串值
+ */
 function requireFlag(flags: Map<string, string | string[]>, name: string): string {
   const v = flags.get(name);
   if (!v || typeof v !== 'string') {
@@ -57,6 +76,12 @@ function requireFlag(flags: Map<string, string | string[]>, name: string): strin
   return v;
 }
 
+/**
+ * 从标志 Map 中读取 --memory-dir（支持多次指定），并校验目录存在性。
+ *
+ * @param flags - parseFlags 的返回值
+ * @returns 已校验存在的目录路径数组
+ */
 function requireMultiDir(flags: Map<string, string | string[]>): string[] {
   const v = flags.get('memory-dir');
   if (!v) {
@@ -73,6 +98,7 @@ function requireMultiDir(flags: Map<string, string | string[]>): string[] {
   return dirs;
 }
 
+/** 打印使用说明 */
 function printUsage(): void {
   console.log(`用法:
   aizen-memory add --content "<text>" --type <type> --memory-dir <path>
@@ -82,6 +108,16 @@ function printUsage(): void {
   aizen-memory rebuild --memory-dir <path>`);
 }
 
+/**
+ * 新增记忆块。生成嵌入向量后写入指定目录。
+ *
+ * 标志：
+ *   --content  正文内容
+ *   --type     块类型 (conversation/document/ai_insight/external)
+ *   --memory-dir 存储目录
+ *   --source-filename 来源文件名（可选，默认 manual）
+ *   --source-section  来源章节（可选）
+ */
 async function cmdAdd(args: string[]): Promise<void> {
   const flags = parseFlags(args);
   const content = requireFlag(flags, 'content');
@@ -99,24 +135,28 @@ async function cmdAdd(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const block = createBlock({
+  const embedder = new OllamaEmbedder();
+  const embedding = await embedder.embed(content);
+
+  const store = new BlockStore(dir);
+  const { blockId } = await store.append({
     type,
     content,
     source: {
       filename: (flags.get('source-filename') as string) ?? 'manual',
       section: (flags.get('source-section') as string) ?? '',
     },
-  });
+  }, embedding);
 
-  const embedder = new OllamaEmbedder();
-  const embedding = await embedder.embed(content);
-
-  const store = new BlockStore(dir);
-  await store.append(block, embedding);
-
-  console.log(`已创建: ${block.blockId}`);
+  console.log(`已创建: ${blockId}`);
 }
 
+/**
+ * 按 blockId 查看记忆块全文。
+ *
+ * 位置参数：blockId
+ * 标志：--memory-dir
+ */
 function cmdGet(args: string[]): void {
   const flags = parseFlags(args);
   const dir = requireFlag(flags, 'memory-dir');
@@ -147,6 +187,14 @@ function cmdGet(args: string[]): void {
   console.log(block.content);
 }
 
+/**
+ * 语义搜索记忆。支持多源合并、Top-K 截断。
+ *
+ * 位置参数：查询文本
+ * 标志：
+ *   --memory-dir 记忆目录（可多次指定）
+ *   -k          返回结果数（默认 3）
+ */
 async function cmdSearch(args: string[]): Promise<void> {
   const flags = parseFlags(args);
 
@@ -186,6 +234,11 @@ async function cmdSearch(args: string[]): Promise<void> {
   }
 }
 
+/**
+ * 查看记忆存储的统计信息（块数、已索引数、向量文件大小）。
+ *
+ * 标志：--memory-dir（可多次指定）
+ */
 function cmdStats(args: string[]): void {
   const flags = parseFlags(args);
 
@@ -208,6 +261,11 @@ function cmdStats(args: string[]): void {
   }
 }
 
+/**
+ * 重建向量索引。为目录下所有块重新生成嵌入向量并写入 .vec 文件。
+ *
+ * 标志：--memory-dir
+ */
 async function cmdRebuild(args: string[]): Promise<void> {
   const flags = parseFlags(args);
   const dir = requireFlag(flags, 'memory-dir');

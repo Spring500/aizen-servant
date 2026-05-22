@@ -4,8 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Retriever, cosineSimilarity } from '../../src/memory/retriever.js';
 import { BlockStore } from '../../src/memory/store.js';
-import { createBlock } from '../../src/memory/block.js';
 
+/**
+ * 构造模拟嵌入器，用 sin 函数生成确定性伪向量（相同文字 → 相同向量）。
+ * 用于测试检索逻辑，不依赖 Ollama。
+ */
 function makeEmbedder() {
   return {
     dimensions: 768,
@@ -51,17 +54,20 @@ describe('Retriever', () => {
     const embedder = makeEmbedder();
     retriever = new Retriever(embedder);
 
-    const b1 = createBlock({ type: 'document', content: '这是关于 Channel 架构的决策' });
-    b1.summary.self = 'ADR-007 Channel 架构';
-    await store1.append(b1, await embedder.embed(b1.content));
+    await store1.append(
+      { type: 'document', content: '这是关于 Channel 架构的决策', summary: { self: 'ADR-007 Channel 架构' } },
+      await embedder.embed('这是关于 Channel 架构的决策'),
+    );
 
-    const b2 = createBlock({ type: 'document', content: 'Python 语言的选择讨论' });
-    b2.summary.self = 'ADR-001 核心语言';
-    await store1.append(b2, await embedder.embed(b2.content));
+    await store1.append(
+      { type: 'document', content: 'Python 语言的选择讨论', summary: { self: 'ADR-001 核心语言' } },
+      await embedder.embed('Python 语言的选择讨论'),
+    );
 
-    const b3 = createBlock({ type: 'document', content: '个人笔记：部署脚本问题' });
-    b3.summary.self = '部署脚本个人笔记';
-    await store2.append(b3, await embedder.embed(b3.content));
+    await store2.append(
+      { type: 'document', content: '个人笔记：部署脚本问题', summary: { self: '部署脚本个人笔记' } },
+      await embedder.embed('个人笔记：部署脚本问题'),
+    );
   });
 
   afterEach(() => {

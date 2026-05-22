@@ -1,14 +1,16 @@
 /**
- * 一次性脚本：将 docs/ADR.md 的每个 ADR section 作为记忆块导入。
+ * 一次性脚本：将 ADR.md 的每个 ADR section 作为记忆块导入到 aizen-memory。
  *
- * 用法: npx tsx scripts/import-adr.ts docs/ADR.md --target .aizen/project/
+ * 自动去重（正文哈希），幂等运行。首次导入全部新建，重复导入全部标记为"已存在"。
+ * 用法: npx tsx scripts/import-adr.ts ADR.md --target .aizen/project/
  */
-
 import { readFileSync, existsSync } from 'node:fs';
 import { BlockStore } from '../src/memory/store.js';
 import { OllamaEmbedder } from '../src/memory/embedder.js';
-import { createBlock } from '../src/memory/block.js';
 
+/**
+ * 主流程：解析 ADR.md → 逐 section 写入记忆存储 → 建立 prev/next 关系链 → 更新哈希。
+ */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -53,41 +55,61 @@ async function main(): Promise<void> {
     const bodyText = content.replace(/^##.*$/m, '').trim();
     const firstLine = bodyText.split('\n').find(l => l.trim().length > 3) ?? '';
 
-    const block = createBlock({
-      type: 'document',
-      content: `${title}\n${content}`,
-      source: {
-        filename: inputFile,
-        section: sectionLabel,
+    // 写入（或去重跳过），获得落盘的 blockId
+    const { blockId, isNew } = await store.append(
+      {
+        type: 'document',
+        content: `${title}\n${content}`,
+        source: {
+          filename: inputFile,
+          section: sectionLabel,
+        },
+        relations: prevBlockId ? { prevId: prevBlockId } : undefined,
+        summary: {
+          self: title.replace(/^#+\s*/, '').slice(0, 100).trim(),
+        },
       },
-      relations: prevBlockId ? { prevId: prevBlockId } : undefined,
-    });
+      await embedder.embed(`${title}\n${content}`),
+    );
 
-    block.summary = {
-      self: title.replace(/^#+\s*/, '').slice(0, 100).trim(),
-      prev: null,
-      next: null,
-    };
+    if (!isNew) {
+      // 已有相同正文的块，仅刷新摘要
+      store.updateBlock(blockId, {
+        summary: {
+          self: title.replace(/^#+\s*/, '').slice(0, 100).trim(),
+          prev: null,
+          next: null,
+        },
+      });
+    }
 
     if (prevBlockId) {
-      const prevBlock = store.getBlock(prevBlockId);
-      if (prevBlock) {
-        prevBlock.relations.nextId = block.blockId;
-        const prevEmbedding = new Float32Array(768);
-        await store.append(prevBlock, prevEmbedding);
+      // 补填前一个块的 nextId 指向当前块
+      const prevExisting = store.getBlock(prevBlockId);
+      if (prevExisting) {
+        store.updateBlock(prevBlockId, {
+          relations: {
+            ...prevExisting.relations,
+            nextId: blockId,
+          },
+        });
       }
     }
 
-    const embedding = await embedder.embed(block.content);
-    await store.append(block, embedding);
-
-    console.log(`录入 ADR-${sectionLabel}: ${firstLine.slice(0, 60)} → 已保存`);
-    prevBlockId = block.blockId;
+    console.log(`录入 ADR-${sectionLabel}: ${firstLine.slice(0, 60)} → ${isNew ? '已保存' : '已存在'}`);
+    prevBlockId = blockId;
   }
 
   console.log(`完成。${sections.length} 个 block 已写入 ${target}`);
+  store.updateHash();
 }
 
+/**
+ * 将 Markdown 文本按 "## ADR-" 或 "### ADR-" 标题拆分为 section 数组。
+ *
+ * @param md - ADR.md 的完整文本
+ * @returns 每个 section 的标题和正文
+ */
 function splitByAdrHeader(md: string): { title: string; content: string }[] {
   const sections: { title: string; content: string }[] = [];
   const lines = md.split('\n');

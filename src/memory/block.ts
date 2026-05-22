@@ -1,11 +1,15 @@
 import { ulid } from 'ulid';
 import { z } from 'zod';
 
+/** 允许的记忆块类型列表 */
 export const BlockTypes = ['conversation', 'document', 'ai_insight', 'external'] as const;
+/** 记忆块类型 */
 export type BlockType = (typeof BlockTypes)[number];
 
+/** ULID 格式校验正则 */
 const ulidRegex = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
+/** 记忆块数据结构 —— 持久化到 JSON 文件的完整 schema */
 export const MemoryBlockSchema = z.object({
   blockId: z.string().regex(ulidRegex, '非法 blockId 格式'),
   type: z.enum(BlockTypes),
@@ -37,6 +41,7 @@ export const MemoryBlockSchema = z.object({
 
 export type MemoryBlock = z.infer<typeof MemoryBlockSchema>;
 
+/** 创建记忆块的输入参数 —— 不包含 blockId，由 store 内部生成 */
 export interface CreateBlockInput {
   type: string;
   content: string;
@@ -46,9 +51,20 @@ export interface CreateBlockInput {
     nextId?: string;
     related?: string[];
   };
+  summary?: {
+    self?: string;
+    prev?: string | null;
+    next?: string | null;
+  };
   meta?: Record<string, unknown>;
 }
 
+/**
+ * 创建记忆块。自动生成 ULID，填充默认字段。
+ *
+ * @param input - 创建参数：type、content 必填，source/relations/summary/meta 可选
+ * @returns 包含 ULID 和全量默认值的 MemoryBlock
+ */
 export function createBlock(input: CreateBlockInput): MemoryBlock {
   const now = Date.now();
   return {
@@ -62,7 +78,11 @@ export function createBlock(input: CreateBlockInput): MemoryBlock {
       nextId: input.relations?.nextId ?? null,
       related: input.relations?.related ?? [],
     },
-    summary: { self: '', prev: null, next: null },
+    summary: {
+      self: input.summary?.self ?? '',
+      prev: input.summary?.prev ?? null,
+      next: input.summary?.next ?? null,
+    },
     weight: { boosts: [], negativeMarks: 0 },
     deprecated: false,
     supersededBy: null,
@@ -70,6 +90,13 @@ export function createBlock(input: CreateBlockInput): MemoryBlock {
   };
 }
 
+/**
+ * 用 Zod schema 校验一个未知对象是否为合法的 MemoryBlock。
+ * 不合法时抛出 ZodError。
+ *
+ * @param block - 待校验的未知对象
+ * @returns 通过校验的 MemoryBlock
+ */
 export function validateBlock(block: unknown): MemoryBlock {
   return MemoryBlockSchema.parse(block);
 }
