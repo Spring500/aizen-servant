@@ -55,4 +55,64 @@ Via: opencode
 
 ## 架构
 
-AizenServant 是一个基于 Pi SDK 的 7x24 多 channel agent。所有架构决策见 `docs/ADR.md`。当前正在建设记忆系统 `aizen-memory`。本文件是稳定的人手写规则，agent 禁止修改。
+AizenServant 是一个基于 Pi SDK 的 7x24 多 channel agent。本文件是稳定的人手写规则，agent 禁止修改。
+
+## 记忆系统（aizen-memory）
+
+项目使用 aizen-memory 管理架构决策记录（ADR）和调研结论。记忆分两层：
+
+| 层 | 路径 | 性质 |
+|----|------|------|
+| 项目记忆 | `.aizen/project/` | 团队共享，从 `ADR.md` 构建索引 |
+| 个人记忆 | `.aizen/personal/` | 私有，记录临时发现和未确认推断 |
+
+### 查询
+
+做架构相关工作前，先查记忆：
+
+```bash
+npx tsx src/memory/cli.ts search "<问题描述>" \
+  --memory-dir .aizen/project/ \
+  --memory-dir .aizen/personal/
+```
+
+如果记忆库尚未构建：
+```bash
+npx tsx scripts/import-adr.ts ADR.md --target .aizen/project/
+```
+
+### 何时写入
+
+#### 写入 ADR（项目记忆）— 三个条件同时满足时
+
+1. 你在 ≥2 个可行方案中做出了选择
+2. 改变这个选择需要修改 ≥3 个文件或影响 ≥2 个模块的接口
+3. 这个选择不能从代码本身一眼看出原因
+
+全部满足 → 编辑根目录 `ADR.md`，追加新条目，然后重建索引：
+```bash
+npx tsx scripts/import-adr.ts ADR.md --target .aizen/project/
+```
+
+#### 写入个人记忆 — 满足任一条件时
+
+- 你通过实验/调研得出了一个结论，且该结论影响后续决策
+- 你发现了一个非显而易见的约束（性能瓶颈、API 限制、兼容性问题）
+- 你排除了一个看似可行但实际不可行的方案（记录"为什么不行"）
+
+```bash
+npx tsx src/memory/cli.ts add \
+  --content "<结论内容>" \
+  --type document \
+  --memory-dir .aizen/personal/
+```
+
+#### 不写 — 以下情况跳过
+
+- 只有一个合理选项，没有真正的"选择"
+- 代码本身已经是文档（命名清晰、类型完整）
+- 临时 workaround 且已在代码注释中标记了 TODO
+
+### 个人记忆提升为项目记忆
+
+当个人记忆中的发现值得团队共享时：将内容写入 `ADR.md`，提交 PR，合并后重建项目索引。
