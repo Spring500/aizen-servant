@@ -52,6 +52,7 @@ Via: opencode
 - 简述用中文，不造缩写
 - 提交末尾附 `Via: opencode`，标注来自 coding agent
 - 人类手动提交时 `Via` 行可省略
+- **禁止使用 `--no-verify`、设置 `HUSKY=0`、修改 `core.hooksPath` 或任何其他方式绕过 commit-msg hook 校验。** hook 报错时必须排查原因、修复问题后重新提交。
 
 ## 架构
 
