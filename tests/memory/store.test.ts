@@ -113,13 +113,13 @@ describe('BlockStore', () => {
     const { blockId } = await store.append({ type: 'document', content: '更新测试' }, emb);
 
     store.updateBlock(blockId, {
-      relations: { prevId: null, nextId: '01J4XK7N8P9Q2R3S4T5V6W7X8', related: [] },
-      summary: { self: '自定义摘要', prev: null, next: null },
+      weight: { boosts: [{ at: Date.now(), sessionForkId: 'test-fork' }], negativeMarks: 0 },
+      meta: { updated: true },
     });
 
     const loaded = store.getBlock(blockId);
-    expect(loaded!.relations.nextId).toBe('01J4XK7N8P9Q2R3S4T5V6W7X8');
-    expect(loaded!.summary.self).toBe('自定义摘要');
+    expect(loaded!.weight.boosts.length).toBe(1);
+    expect(loaded!.meta).toEqual({ updated: true });
     expect(loaded!.content).toBe('更新测试');
   });
 

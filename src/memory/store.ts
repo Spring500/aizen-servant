@@ -117,7 +117,7 @@ export class BlockStore {
   }
 
   /**
-   * 更新已有块的非核心字段（relations、summary、weight、meta 等）。
+   * 更新已有块的非核心字段（weight、meta 等）。
    * 不修改正文内容和向量文件。undefined 值的字段会被忽略。
    *
    * @param blockId - 要更新的块 ID

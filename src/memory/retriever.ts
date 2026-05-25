@@ -4,7 +4,6 @@ import type { Embedder } from './embedder.js';
 export interface SearchResult {
   blockId: string;
   score: number;
-  summary: string;
   content: string;
   source: string;
 }
@@ -73,7 +72,6 @@ export class Retriever {
         allResults.push({
           blockId: block.blockId,
           score,
-          summary: block.summary.self,
           content: block.content,
           source: dir,
         });

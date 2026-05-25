@@ -16,16 +16,6 @@ export const MemoryBlockSchema = z.object({
   createdAt: z.number(),
   source: z.record(z.string(), z.string()).default({}),
   content: z.string().min(1, 'content 不能为空'),
-  relations: z.object({
-    prevId: z.string().nullable().default(null),
-    nextId: z.string().nullable().default(null),
-    related: z.array(z.string()).default([]),
-  }).default({}),
-  summary: z.object({
-    self: z.string().default(''),
-    prev: z.string().nullable().default(null),
-    next: z.string().nullable().default(null),
-  }).default({}),
   weight: z.object({
     boosts: z.array(z.object({
       at: z.number(),
@@ -46,23 +36,13 @@ export interface CreateBlockInput {
   type: string;
   content: string;
   source?: Record<string, string>;
-  relations?: {
-    prevId?: string;
-    nextId?: string;
-    related?: string[];
-  };
-  summary?: {
-    self?: string;
-    prev?: string | null;
-    next?: string | null;
-  };
   meta?: Record<string, unknown>;
 }
 
 /**
  * 创建记忆块。自动生成 ULID，填充默认字段。
  *
- * @param input - 创建参数：type、content 必填，source/relations/summary/meta 可选
+ * @param input - 创建参数：type、content 必填，source/meta 可选
  * @returns 包含 ULID 和全量默认值的 MemoryBlock
  */
 export function createBlock(input: CreateBlockInput): MemoryBlock {
@@ -73,16 +53,6 @@ export function createBlock(input: CreateBlockInput): MemoryBlock {
     createdAt: now,
     source: input.source ?? {},
     content: input.content,
-    relations: {
-      prevId: input.relations?.prevId ?? null,
-      nextId: input.relations?.nextId ?? null,
-      related: input.relations?.related ?? [],
-    },
-    summary: {
-      self: input.summary?.self ?? '',
-      prev: input.summary?.prev ?? null,
-      next: input.summary?.next ?? null,
-    },
     weight: { boosts: [], negativeMarks: 0 },
     deprecated: false,
     supersededBy: null,

@@ -182,7 +182,6 @@ function cmdGet(args: string[]): void {
   console.log(`类型:       ${block.type}`);
   console.log(`来源:       ${JSON.stringify(block.source)}`);
   console.log(`创建时间:   ${d.toISOString()}`);
-  console.log(`摘要:       ${block.summary.self || '(无)'}`);
   console.log();
   console.log(block.content);
 }
@@ -226,7 +225,7 @@ async function cmdSearch(args: string[]): Promise<void> {
     }
     for (const r of results) {
       const sourceLabel = r.source.split('/').slice(-2).join('/');
-      console.log(`[${sourceLabel}] ${r.score.toFixed(3)}  ${r.summary || '(无摘要)'}`);
+      console.log(`[${sourceLabel}] ${r.score.toFixed(3)}  ${r.blockId}`);
     }
   } catch (err) {
     console.error(`检索失败: ${(err as Error).message}`);

@@ -14,8 +14,6 @@ describe('createBlock', () => {
     expect(block.content).toBe('这是测试内容');
     expect(block.source).toEqual({ filename: 'test.md' });
     expect(block.createdAt).toBeTypeOf('number');
-    expect(block.relations).toEqual({ prevId: null, nextId: null, related: [] });
-    expect(block.summary).toEqual({ self: '', prev: null, next: null });
     expect(block.weight).toEqual({ boosts: [], negativeMarks: 0 });
     expect(block.deprecated).toBe(false);
     expect(block.supersededBy).toBeNull();

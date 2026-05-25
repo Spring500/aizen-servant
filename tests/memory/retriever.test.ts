@@ -55,17 +55,17 @@ describe('Retriever', () => {
     retriever = new Retriever(embedder);
 
     await store1.append(
-      { type: 'document', content: '这是关于 Channel 架构的决策', summary: { self: 'ADR-007 Channel 架构' } },
+      { type: 'document', content: '这是关于 Channel 架构的决策' },
       await embedder.embed('这是关于 Channel 架构的决策'),
     );
 
     await store1.append(
-      { type: 'document', content: 'Python 语言的选择讨论', summary: { self: 'ADR-001 核心语言' } },
+      { type: 'document', content: 'Python 语言的选择讨论' },
       await embedder.embed('Python 语言的选择讨论'),
     );
 
     await store2.append(
-      { type: 'document', content: '个人笔记：部署脚本问题', summary: { self: '部署脚本个人笔记' } },
+      { type: 'document', content: '个人笔记：部署脚本问题' },
       await embedder.embed('个人笔记：部署脚本问题'),
     );
   });
