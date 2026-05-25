@@ -1,11 +1,24 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import type { MemoryBlock, CreateBlockInput } from './block.js';
 import { createBlock } from './block.js';
 
 /** 每条向量在 .vec 文件中的字节数：768 维 × 4 字节(float32) */
 const VEC_ROW_BYTES = 768 * 4;
+
+/** append() 单次调用的步骤耗时记录 */
+export interface AppendTiming {
+  ensureDir: number;
+  contentHash: number;
+  dedupLookup: number;
+  createBlock: number;
+  writeJson: number;
+  writeVec: number;
+  total: number;
+  isNew: boolean;
+}
 
 /**
  * 记忆块持久化存储。
@@ -23,6 +36,8 @@ export class BlockStore {
   private vecPath: string;
   /** 目录 mtime 哈希文件路径 */
   private hashPath: string;
+  /** append() 调用的耗时记录，每次调用 push 一条 */
+  timingLog: AppendTiming[] = [];
 
   /**
    * @param memoryDir - 记忆存储根目录，如 .aizen/project/
@@ -47,21 +62,49 @@ export class BlockStore {
    * @returns 最终落盘的 blockId 及是否为首次写入
    */
   async append(input: CreateBlockInput, embedding: Float32Array): Promise<{ blockId: string; isNew: boolean }> {
-    this.ensureDir();
+    const t: AppendTiming = {
+      ensureDir: 0, contentHash: 0, dedupLookup: 0,
+      createBlock: 0, writeJson: 0, writeVec: 0,
+      total: 0, isNew: true,
+    };
+    const t0 = performance.now();
 
+    let tSub = performance.now();
+    this.ensureDir();
+    t.ensureDir = +(performance.now() - tSub).toFixed(3);
+
+    tSub = performance.now();
     const contentHash = this.computeContentHash(input.content);
+    t.contentHash = +(performance.now() - tSub).toFixed(3);
+
+    tSub = performance.now();
     const existingId = this.findBlockIdByContentHash(contentHash);
+    t.dedupLookup = +(performance.now() - tSub).toFixed(3);
 
     if (existingId) {
+      t.isNew = false;
+      t.total = +(performance.now() - t0).toFixed(3);
+      this.timingLog.push(t);
       return { blockId: existingId, isNew: false };
     }
 
+    tSub = performance.now();
     const block = createBlock(input);
+    t.createBlock = +(performance.now() - tSub).toFixed(3);
+
     const { blockId, embedding: _emb, ...rest } = block;
+
+    tSub = performance.now();
     const jsonPath = join(this.blocksDir, `${blockId}.json`);
     writeFileSync(jsonPath, JSON.stringify(rest, null, 2), 'utf-8');
-    this.writeSortedVec(blockId, embedding);
+    t.writeJson = +(performance.now() - tSub).toFixed(3);
 
+    tSub = performance.now();
+    this.writeSortedVec(blockId, embedding);
+    t.writeVec = +(performance.now() - tSub).toFixed(3);
+
+    t.total = +(performance.now() - t0).toFixed(3);
+    this.timingLog.push(t);
     return { blockId, isNew: true };
   }
 
@@ -219,6 +262,16 @@ export class BlockStore {
     }
 
     return { blockCount: ids.length, indexedCount, vecSizeBytes: vecSize };
+  }
+
+  /**
+   * 检查正文内容是否已存在于存储中（便捷方法，等价于 computeContentHash + findBlockIdByContentHash）。
+   *
+   * @param content - 正文内容
+   * @returns 已存在的 blockId，不存在时返回 null
+   */
+  findByContent(content: string): string | null {
+    return this.findBlockIdByContentHash(this.computeContentHash(content));
   }
 
   /**
