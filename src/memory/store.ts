@@ -39,6 +39,9 @@ export class BlockStore {
   /** append() 调用的耗时记录，每次调用 push 一条 */
   timingLog: AppendTiming[] = [];
 
+  /** 正文 sha256 → blockId 的内存缓存，首次访问时懒加载 */
+  private contentHashCache: Map<string, string> | null = null;
+
   /**
    * @param memoryDir - 记忆存储根目录，如 .aizen/project/
    */
@@ -93,6 +96,11 @@ export class BlockStore {
     t.createBlock = +(performance.now() - tSub).toFixed(3);
 
     const { blockId, embedding: _emb, ...rest } = block;
+
+    // 写入新块后同步更新内存缓存
+    if (this.contentHashCache) {
+      this.contentHashCache.set(contentHash, blockId);
+    }
 
     tSub = performance.now();
     const jsonPath = join(this.blocksDir, `${blockId}.json`);
@@ -275,19 +283,20 @@ export class BlockStore {
   }
 
   /**
-   * 按正文内容哈希查找已存在的 blockId（SHA256）。
-   * 遍历全部块逐个比对哈希，调用方应避免高频使用。
+   * 按正文内容哈希查找已存在的 blockId。
+   * 首次调用时构建 sha256 → blockId 内存缓存，后续 O(1) 查询。
    *
    * @param hash - computeContentHash 的输出
    * @returns 匹配的 blockId，不存在时返回 null
    */
   findBlockIdByContentHash(hash: string): string | null {
-    for (const block of this.getAllBlocks()) {
-      if (this.computeContentHash(block.content) === hash) {
-        return block.blockId;
+    if (!this.contentHashCache) {
+      this.contentHashCache = new Map();
+      for (const block of this.getAllBlocks()) {
+        this.contentHashCache.set(this.computeContentHash(block.content), block.blockId);
       }
     }
-    return null;
+    return this.contentHashCache.get(hash) ?? null;
   }
 
   /**
