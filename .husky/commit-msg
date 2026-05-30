@@ -1,2 +1,2 @@
 #!/usr/bin/env sh
-bun run scripts/commit-msg.ts "$1"
+node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/commit-msg.ts "$1"

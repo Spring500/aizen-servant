@@ -20,8 +20,8 @@
 ## 技术约定
 
 - **语言**: TypeScript strict mode，ESM (`"type": "module"`)
-- **运行时**: Node.js ≥ 20，开发期 `tsx`，生产期 `bun build --compile`
-- **包管理**: bun
+- **运行时**: Node.js ≥ 22，开发期 `tsx`，生产期 Docker 镜像部署（次分发 npm）
+- **包管理**: pnpm
 - **测试**: Vitest，TDD 流程——先写失败的测试，再写实现
 - **持久化**: 纯文本文件（JSONL + 二进制 `.vec`），零数据库
 - **代码风格**: 每个函数必须有中文注释说明用途和参数含义。逻辑不可自明处补充注释。不用注释重复代码本身（"计算总价"对 `calculateTotalPrice` 是噪音）
