@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AizenServant 路线图</title>
+</head>
+<body>
+<script type="text/x-markdown">
+
+# AizenServant 路线图
+
+`2026-05-30` · 两条并行线：A=agent 骨架 · B=记忆补完
+
+> 需求见 `requirements.html`，模块见 `modules.html`，决策见 `ADR.md`。
+> 状态：✅ 已完成 / 🚧 进行中 / ⬜ 未开始
+
+---
+
+## 已交付：默认记忆插件（部分）
+
+| 交付物 | 状态 |
+|--------|------|
+| 块模型、文件存储、`.vec`、mtime 脏检测 | ✅ |
+| Embedding 抽象（Ollama） | ✅ |
+| 向量检索（余弦 + Top-K + 多源合并） | ✅ |
+| 内容哈希去重（阶段一） | ✅ |
+| CLI（add/get/search/stats/rebuild）+ ADR 导入 | ✅ |
+
+**未完成（转入 B 线）：** MemoryProvider 契约、relations 图、fork 遍历、动态权重评分、异质源入库、语义去重阶段二。
+
+---
+
+## 并行线总览
+
+:::mermaid
+flowchart TB
+  subgraph A["A 线 · agent 骨架"]
+    A0["A0 现状对齐+workspace 化"] --> A1["A1 Pi 接入"] --> A2["A2 单 session 引擎"] --> A3["A3 HTTP 渠道"] --> A4["A4 记忆检索接入"] --> A5["A5 对话归档"] --> A6["A6 授权网关"] --> A7["A7 多渠道"] --> A8["A8 system prompt"] --> A9["A9 容错/日志/Docker"]
+  end
+  subgraph B["B 线 · 记忆补完"]
+    B0["B0 MemoryProvider 契约"] --> B1["B1 重引入 relations"] --> B2["B2 图遍历"] --> B3["B3 动态权重"] --> B4["B4 异质源+调度"] --> B5["B5 语义去重"] --> B6["B6 插件动态加载"]
+  end
+  B0 -.前置.-> A4
+  B2 -.前置.-> A4
+:::
+
+**汇合点：** A4（检索接入）依赖 B0（契约）+ B2（遍历）。B0/B1 应在 A1–A3 期间先行。
+
+---
+
+## 里程碑甘特
+
+:::mermaid
+gantt
+  dateFormat X
+  axisFormat M%d
+  title 里程碑（相对排期，非绝对日期）
+  section A 线
+  A0 现状对齐        :a0, 0, 1
+  A1 Pi 接入         :a1, after a0, 1
+  A2 单 session      :a2, after a1, 1
+  A3 HTTP 渠道       :a3, after a2, 1
+  A4 检索接入        :a4, after a3, 1
+  A5 对话归档        :a5, after a4, 1
+  A6 授权网关        :a6, after a5, 1
+  A7 多渠道          :a7, after a6, 1
+  A8 system prompt   :a8, after a7, 1
+  A9 容错/Docker     :a9, after a8, 1
+  section B 线
+  B0 契约            :b0, 0, 1
+  B1 relations       :b1, after b0, 1
+  B2 图遍历          :b2, after b1, 1
+  B3 动态权重        :b3, after b2, 1
+  B4 异质源+调度     :b4, after b3, 1
+  B5 语义去重        :b5, after b4, 1
+  B6 动态加载        :b6, after b5, 1
+:::
+
+| 里程碑 | 含义 | 包含 |
+|--------|------|------|
+| **M1 最小可对话** | HTTP 进、agent 回 | A0–A3 |
+| **M2 有记忆的对话** | 检索注入 + 归档召回 | A4–A5 + B0–B3 |
+| **M3 多渠道 + 自主提炼** | 多渠道 + 定时 insight | A7–A8 + B4 |
+| **M4 可发布** | 授权网关 + 容错 + Docker + 可替换插件 | A6, A9 + B5–B6 |
+
+---
+
+## A 线：agent 骨架
+
+| 步 | 交付 | 验证 |
+|----|------|------|
+| **A0** 现状对齐 | 升级 workspace 三包（ADR-005）；包名归 `@aizen/*`；文档与代码一致 | 三包可独立 install |
+| **A1** Pi 接入 | 装 Pi SDK，跑通最小 session+prompt+`agent_end`；`mock-pi` 工厂 | 一个 integration 测试用 `inMemory()` 完成单轮 |
+| **A2** 单 session 引擎 | AgentEngine + 队列 + SessionStrategy 接口 + `SingleSessionStrategy` | 多消息入队按 ADR-008 循环；切策略仅改配置 |
+| **A3** HTTP 渠道 | `channels/http` REST 入站（盖认证身份）+ `http_send` | **验收 1**：发消息→经 send tool 回复 |
+| **A4** 记忆检索接入 | retrieval 编排：构造 ExploreFn（Pi fork）→ `retrieve` → 注入（不写历史）| **验收 2 前半**：注入块在本轮、下轮消失 |
+| **A5** 对话归档 | `agent_end`→`store(conversation)`；记录注入块；`memory_mark` tool | **验收 2**：第二轮召回第一轮归档块 |
+| **A6** 授权（分阶段，**持续迭代**，见 `research-tool-permissions.html`） | **P0**：不给 exec，仅窄工具 + 信任表 + `on_behalf_of`（M1/M2 即可，本身安全）。**P1**：引入 exec 时上每 session 沙箱 + deny>ask>allow + 逃逸带外确认。**P2**：可选 LLM 灰色地带审查员（ADR-018，Experimental）| **验收 6**：陌生人无法触发逃逸工具 |
+| **A7** 多渠道 | Discord / Telegram 入站 + send tool | 跨渠道上下文共享 |
+| **A8** system prompt | 指导 LLM 用 send tool、归因记忆、填 `on_behalf_of`（ADR 未决 #1）| 多用户混入不串台 |
+| **A9** 容错/日志/分发 | 进程级守护、结构化日志、Docker 镜像 + CI（ADR-003）| 容器启动；崩溃自恢复 |
+
+---
+
+## B 线：记忆补完
+
+| 步 | 交付 | 验证 |
+|----|------|------|
+| **B0** MemoryProvider 契约 | `memory-contract` 包；默认实现 implements（ADR-015）| mock 插件可替换默认，行为不变（**验收 4**）|
+| **B1** 重引入 relations | schema 加回 `relations`；导入串链、归档回填 | 块间形成可遍历图 |
+| **B2** 图遍历 | 默认实现 traversal，经注入 ExploreFn 沿 relations 探索（ADR-009d 修订）| 语义不相似但拓扑相连的块能召回 |
+| **B3** 动态权重 | 评分 `cosine×boost×decay^marks×recency`（ADR-009c/e）| 常引用块上浮、标记块沉底 |
+| **B4** 异质源+调度 | document 监听/导入、external 抓取；scheduler 提炼 ai_insight（ADR-016）| **验收 5**：定时生成 ai_insight 并召回 |
+| **B5** 语义去重 | 余弦>0.95 触发 LLM 归并，旧块 `deprecated`+`supersededBy`（ADR-013）| 高相似块归并、旧块可追溯不参与检索 |
+| **B6** 插件动态加载 | config 指定 → 动态 import + 校验；最小第三方插件验证 | **验收 4 完整**：改配置切换后端 |
+
+---
+
+## 一期不锁定
+
+- 记忆块 TTL/淘汰（ADR 未决 #5，凭动态权重）
+- WebSocket 渠道（先 HTTP）
+- cron 表达式（先固定周期）
+- RPC 外包 worker（ADR-002，可选）
+- 单文件二进制（ADR-003，按需）
+
+</script>
+<script src="https://spring500.github.io/enhanced-doc/enhanced-doc.js"></script>
+</body>
+</html>

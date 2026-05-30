@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>调研：工具权限与授权</title>
+</head>
+<body>
+<script type="text/x-markdown">
+
+# 调研：Agent 工具权限与授权
+
+`2026-05-30` · **活文档 · 持续迭代** · 喂给 ADR-018
+
+!!! Warning 文档性质
+    这是一份**调研 + 设计探索文档**，不是定论。权限是难题，需在后续工作中反复研究、推翻、迭代。本文记录：业界怎么做、我们暂定的框架、初版可行实现、以及**待深入的开放问题**。决策固化进 `ADR.md`（ADR-018，当前 Experimental）。
+
+!!! Note 调研可信度
+    Codex 部分基于官方文档（developers.openai.com）一手核实；其余部分基于官方文档 + DeepWiki/源码描述 + 二手博客，**未逐行读源码**。结论以"机制方向"为准，细节待核。
+
+---
+
+## 1. 核心问题
+
+7x24 多用户（含群聊）聊天助手，要给 agent 工具（含潜在的 bash/任意执行），又要防止陌生人诱导它用底层权限。两个被证伪的幻想：
+
+1. **靠 prompt 控权** —— 提示注入可绕过，不是边界。
+2. **靠静态分析判任意程序安全** —— `mytool`/`deploy.sh`/`npm run x` 对分析器不透明，Rice 定理下不可判定。
+
+---
+
+## 2. 业界怎么做（5 个 agent）
+
+| 工具 | 硬边界 | 确定性层 | 用 LLM 判安全 | LLM 角色 |
+|------|--------|----------|:---:|----------|
+| **Codex** | OS 沙箱 Seatbelt(mac)/Landlock(linux)，默认禁网、限 workspace | 沙箱边界 + 批准策略类别 | **是（可选）** | Guardian/auto-review：专用模型 `codex-auto-review` 裁决越界灰色地带，分级 low–critical，**不扩权、失败关闭** |
+| **Hermes** | 容器后端（Docker 等，用了才有；本地默认无隔离） | regex 危险模式 + Tirith(Rust 内容扫描器) | **是（可选）** | smart 模式 = LLM 辅助风险评分；manual=纯人工，off=不问 |
+| **Claude Code** | 权限规则（无内置沙箱）+ 可选 hooks | deny>ask>allow（先匹配赢）+ 只读内置白名单 + shell 运算符感知 | **默认否** | 可在 PreToolUse hook 自接 LLM |
+| **opencode** | 模式规则（无内置沙箱） | allow/ask/deny glob（后匹配赢）+ 分层合并 | 否 | — |
+| **OpenClaw** | 沙箱默认 + elevated 受控破墙 | 工具策略→exec approvals→allowlist/safe bins | 否 | 人工/远程批准 |
+
+**结论：没有一个让所有 bash 都确认。** 共同模式：
+
+1. **硬边界是沙箱/容器**，谁认真谁靠它（Codex、Hermes 容器后端、OpenClaw）。沙箱不解析命令、只约束进程，所以混淆/不透明程序也困得住。
+2. **确定性规则只降噪、不保安全**：自动放行明显安全、拦掉明显危险，对不透明程序一律不自动放行。
+3. **LLM 审查员是可选的灰色地带裁决层**：Codex Guardian、Hermes smart。关键约束——**只 gate 不 grant、失败关闭、永不当硬边界**（Codex 原话 "reviewer swap, not a permission grant"；最佳实践 "Guardian is for the grey area where static rules can't decide"）。
+4. **通用好做法**：失败关闭、批准防篡改（OpenClaw：命令/cwd/文件 drift 变了就拒）、被禁工具在模型调用前移出 schema、远程/带外批准 + 超时取消、per-agent 隔离。
+5. **多用户共享上下文的归因**：这些基本都是**单用户本地 coding agent**，没解决"群聊里陌生人"问题。最接近的是 Hermes/OpenClaw 的"谁能交互"allowlist/配对码。→ **这块是我们场景特有的，业界无现成答案。**
+
+### 2.1 几个值得记的细节
+
+- **Codex auto-review**：起于 "Smart Approvals"(PR #13860)，后用专用模型 `codex-auto-review`(PR #18169)。只对"已需批准"的越界动作生效，不放大可写目录/网络。构建/解析/超时**失败关闭**。
+- **Hermes Tirith**：Rust 确定性扫描器，查同形字 URL、ANSI 终端注入、`curl|bash`（硬拦）。`tirith_fail_open` 默认 **true**（不安全默认，高安全环境应设 false）。容器后端**无条件跳过**批准检查（沙箱即边界）。独立审计发现：本地默认（`env_type=local`）LLM 可在主机执行任意命令、regex 可绕过——**佐证"软件检查不可靠，沙箱才是边界"**。
+- **Claude Code**：deny>ask>allow 先匹配赢；shell 运算符感知（`Bash(git status)` 不匹配 `git status && rm -rf`）；deny 裸工具名会把工具移出上下文。
+
+---
+
+## 3. 我们暂定的框架（分层授权）
+
+!!! Note
+    这是框架，不是最终实现。落地分阶段见 §4。
+
+:::mermaid
+flowchart TB
+  T["工具调用 (带 on_behalf_of)"] --> L0{"L0 工具暴露<br/>被禁工具不在 schema"}
+  L0 --> L1["L1 每 session 沙箱（硬边界·OS 强制）<br/>执行被困住，框住对主机/别 session 的爆炸半径"]
+  L1 --> L2{"L2 确定性快路"}
+  L2 -->|"只读内置/owner 白名单"| ALLOW["放行"]
+  L2 -->|"明显危险模式"| DENY["拒绝"]
+  L2 -->|"其余"| L3{"L3 逃逸闸<br/>联网/出沙箱/花钱?"}
+  L3 -->|否, 沙箱内| ALLOW
+  L3 -->|是| L4{"L4 多用户<br/>actor 在场+信任级够?"}
+  L4 -->|否| DENY
+  L4 -->|是| L5{"L5 灰色地带裁决"}
+  L5 -->|"人工 ask / owner 带外确认"| OK["批准→放行"]
+  L5 -->|"可选 LLM 审查员(gate-only,失败关闭)"| OK
+  OK --> AUDIT["L6 防篡改校验 + 审计日志"]
+:::
+
+### 不变量（任何阶段都不能破）
+
+1. **沙箱是唯一硬安全保证**；其上各层**只能收紧、不能扩权**。
+2. **失败关闭**：无法判定 / 超时 / 组件不可用 → 拒。
+3. **LLM 永不作硬边界**：只在灰色地带做裁决，且只能 gate 不能 grant。
+4. **身份不可由 LLM 伪造**：发件人身份由渠道适配器在代码层从平台认证 ID 盖章。
+5. **批准 == 执行**：批准的载荷与执行的载荷逐字节一致，drift 即拒。
+6. **无沙箱则不给任意执行工具**：某部署环境隔离不了 → 只留窄口径只读工具。
+
+---
+
+## 4. 初版可行实现（分阶段）
+
+按"先安全、后能力、再优化"分三阶段。**越早的阶段越简单且本身安全。**
+
+| 阶段 | 内容 | 为什么本身安全 |
+|------|------|----------------|
+| **P0（MVP）** | **不给任意 bash/exec**。只给窄口径工具：`*_send`、`memory_search/mark`、（可选）限定 workspace 的 `read_file`/`list_dir`。+ 信任表 `(channel,senderId)→tier`（默认拒）+ 按 tier 暴露工具 + `on_behalf_of` 校验在场 | 没有逃逸能力的工具 → 无需沙箱/审查机制，攻击面≈0 |
+| **P1** | 引入 exec 时**同时**上：每 session 沙箱（容器/bubblewrap/Landlock）+ deny>ask>allow 规则 + 只读内置 + 逃逸动作 owner 带外确认（超时→拒）+ 批准防篡改 | 沙箱兜底 + 逃逸闸 + 失败关闭 |
+| **P2（迭代）** | 可选 LLM 灰色地带审查员（仿 Codex Guardian，gate-only/失败关闭）+ 沙箱拓扑随 session 策略（per-user 沙箱）+ 必要时 shell 解析 | 在硬边界之上提质，不改变安全保证 |
+
+### P0 的网关接口草案（够实现，不含沙箱）
+
+```typescript
+type Verdict = 'allow' | 'ask' | 'deny';
+interface ToolCall { tool: string; args: unknown; onBehalfOf: string; }
+interface AuthContext {
+  participants: Map<string, TrustTier>;  // 本轮认证在场者→信任级（代码盖章）
+}
+interface Gateway {
+  // P0：只查"工具是否对该 actor 的 tier 暴露 + actor 是否在场"，无沙箱无确认
+  decide(call: ToolCall, ctx: AuthContext): Verdict;
+}
+```
+
+P0 不需要 shell 解析、不需要沙箱——因为没有 exec 工具。这让我们能先把 agent 跑起来（roadmap M1/M2），把权限的重活留到真要 exec 时（P1）。
+
+---
+
+## 5. 待深入研究的开放问题
+
+!!! Note 这些是后续迭代的研究清单
+    现在不解决，标记在此，随工作推进逐个攻。
+
+1. **沙箱技术选型**：服务已在 Docker 内，per-session 沙箱怎么做？嵌套容器（sysbox/podman）vs bubblewrap vs Landlock vs gVisor——隔离强度/性能/复杂度权衡。
+2. **逃逸检测怎么落地**：网络出口怎么拦（egress proxy？默认 deny + 白名单域名？）、文件系统边界怎么定。
+3. **要不要 LLM 审查员**：成本/延迟/可靠性；失败模式（Codex 的 "无 assessment payload" 问题）；它判错的代价是否真被沙箱兜住。
+4. **多用户归因的残余风险**：共享 session 里"受骗代理"——LLM 被骗填 `on_behalf_of=admin`，带外确认能兜住高危，但中危呢？是否需要更强的 per-message 归因。
+5. **信任分级粒度**：tier 怎么分（owner/trusted/guest/stranger?）、配对/pairing 怎么做（对标 Hermes）、跨渠道同一人怎么认。
+6. **记忆的跨用户/跨 session 边界**：检索注入会不会泄露 A 用户的记忆给 B？（与 ADR-009/011 交叉）
+7. **审计与可观测**：工具调用审计日志格式，与 NF3 日志统一。
+
+---
+
+## 6. 一句话现状
+
+**硬边界靠沙箱（确定性/OS），确定性规则降噪，灰色地带可选 LLM 审查员裁决——但只能收紧、失败关闭、永不扩权；多用户归因是我们自建的部分。初版 P0 先不给 exec、靠窄工具 + 信任表，安全且能先跑起来。**
+
+## Sources
+
+- Codex — [Auto-review](https://developers.openai.com/codex/concepts/sandboxing/auto-review)、[Agent approvals & security](https://developers.openai.com/codex/agent-approvals-security)、[Sandboxing](https://developers.openai.com/codex/concepts/sandboxing)
+- Hermes — [Security & Command Approval (DeepWiki)](https://deepwiki.com/NousResearch/hermes-agent/5.4-security-and-command-approval)、[Security docs](https://hermes-agent.nousresearch.com/docs/user-guide/security/)、[GitHub](https://github.com/nousresearch/hermes-agent)
+- Claude Code — [Permissions](https://code.claude.com/docs/en/permissions)
+- OpenCode — [Permissions](https://opencode.ai/docs/permissions/)
+- OpenClaw — [Exec approvals](https://docs.openclaw.ai/tools/exec-approvals)、[Security](https://docs.openclaw.ai/gateway/security)
+
+</script>
+<script src="https://spring500.github.io/enhanced-doc/enhanced-doc.js"></script>
+</body>
+</html>

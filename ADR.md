@@ -85,37 +85,37 @@ SDK 在集成深度、类型安全、并发管理上全面占优。进程隔离�
 ## ADR-003: 构建与分发
 
 - **Status:** Accepted
-- **Date:** 2026-05-20
+- **Date:** 2026-05-30
+- **Supersedes:** 初版（2026-05-20，Bun compile 跨平台二进制 → 已废弃）
 
 ### Context
 
-需要将 TypeScript 项目编译为可分发的产物。初期通过 GitHub Releases 发布多平台可执行程序，长期考虑 npm 发布。
+AizenServant 是 7x24 常驻服务（ADR-002），不是本地交互式 CLI。服务的天然分发形态是容器镜像或包安装，而非单文件二进制。初版继承了 Pi 的 `bun build --compile` 路线——但那是为 CLI 工具设计的分发形态，与服务器不匹配。
 
 ### Decision
 
-**使用 Bun compile（`bun build --compile`）编译为跨平台二进制，通过 GitHub Actions 的多平台矩阵（linux-x64, mac-arm64, win-x64）自动构建并发布到 GitHub Releases。**
+**主分发用 Docker 镜像，次分发用 npm。运行时为 Node ≥ 22（保留 ADR-001），不使用 Bun。**
+
+- 开发：Node + pnpm + tsx（或 Node 原生 type-stripping）+ Vitest
+- 分发：Docker 镜像（主，自带运行时与重启守护）+ npm 包（次，给不用 Docker 的自托管者）
 
 ### Rationale
 
-调研结论：
+| 维度 | Docker/npm + Node | Bun compile 二进制 |
+|------|-------------------|--------------------|
+| 形态匹配 | ✅ 服务器即容器/服务 | ❌ 为本地 CLI 设计 |
+| 跨平台 | ✅ 容器天然跨平台 | 需各平台分别编译 |
+| Pi 兼容 | ✅ Pi 原生 Node | bun 对 Node 兼容非 100%，native addon(koffi) 有坑 |
+| 7x24 稳定 | ✅ Node 久经考验 | bun 常驻进程长期稳定性未验证 |
+| 守护重启 | ✅ Docker restart / systemd 白拿（ADR-002） | 需自建 |
 
-| 方案 | 兼容 Pi | 复杂度 | 结论 |
-|------|---------|--------|------|
-| Bun compile | Pi 官方 build script 已使用此方案 | 低 | ✅ 可行 |
-| Node SEA | 与 Pi 的模块加载方式冲突，需改造 | 高 | ❌ |
-| Bundled JS + shell wrapper | 可运行，但不满足"可执行程序"需求 | 最低 | ❌ |
-
-Pi 项目源码中存在 `bun build --compile ./dist/bun/cli.js --outfile dist/pi`，证明 Bun 兼容性是经过验证的、被刻意维护的路径。
-
-Pi SDK 的核心依赖全部为纯 JS/TS，无 native addon（optional deps `@mariozechner/clipboard` 和 `koffi` 不影响核心功能）。
+单文件二进制是给"装在本机的 CLI"用的；服务器不需要它。
 
 ### Consequences
 
-- 开发期使用 `tsx` 运行，无需 Bun
-- CI 构建需要 Bun 环境
-- 编译产物大小约 80-100MB（内嵌 Bun 运行时）
-- 跨平台编译需在各自平台执行（GitHub Actions matrix）
-- 暂不出 npm 包
+- CI 产出 Docker 镜像并推送；npm 包为可选次通道
+- 不引入 Bun 工具链
+- 若将来出现"无 Docker 无 Node、单文件即跑"的真实需求，再引回 bun compile，不影响现有代码
 
 ---
 
@@ -156,30 +156,38 @@ Pi SDK 的核心依赖全部为纯 JS/TS，无 native addon（optional deps `@ma
 
 ---
 
-## ADR-005: 包结构
+## ADR-005: 包结构 — Workspace 三包
 
 - **Status:** Accepted
-- **Date:** 2026-05-20
+- **Date:** 2026-05-30
+- **Supersedes:** 初版（2026-05-20，单包结构 → 已废弃）
 
 ### Context
 
-需要决定项目是单包还是 monorepo。
+记忆系统定为完整插件机制（ADR-015）：第三方/云端记忆插件必须能在不依赖整个应用的前提下被实现。单包结构无法提供这种边界——插件与应用混在一个 package 里，无法独立依赖、独立版本。
 
 ### Decision
 
-**前期使用单一包结构。** 目录按功能模块划分（`src/core/`, `src/channels/`, `src/scheduler/`, `src/memory/` 等）。当 channel 数量或复杂度增长到需要独立版本管理时，再拆分为 monorepo。
+**升级为 pnpm workspace 三包：**
+
+| 包 | 职责 | 依赖 |
+|----|------|------|
+| `@aizen/memory-contract` | MemoryProvider 接口、ExploreFn、数据类型。零运行时依赖，极稳定 | 无 |
+| `@aizen/memory-default` | 文件存储默认记忆插件（现 `src/memory/*` 演进） | 仅 contract |
+| `@aizen/servant` | 主应用：core/channels/retrieval/scheduler/config | contract（运行时按配置加载插件） |
 
 ### Rationale
 
-- 初期开发速度快，不需要处理 monorepo 的版本协调、跨包引用等问题
-- `pnpm` 对 monorepo 有原生支持，后期拆分路径清晰
-- 单一包不影响内部模块边界（通过清晰的目录和接口隔离即可）
+- **app 与所有插件只依赖 contract，彼此不依赖**——这是"可替换、可云端自管"的结构前提
+- pnpm 严格 node_modules 在安装期强制此边界（无幽灵依赖），npm 扁平提升做不到
+- 第三方插件 = 另一个只依赖 contract 的包
 
 ### Consequences
 
-- 所有代码在一个 `package.json` 下
-- 目录结构承担模块边界职责
-- 对外发布的是统一的二进制，内部模块拆分不影响用户
+- 根 `package.json` 为 workspace 私有根；`pnpm-workspace.yaml` 已就位
+- 原 `aizen-memory` 包归入 `@aizen/memory-default`
+- `import-adr.ts`、`aizen-memory` CLI 作为 memory-default 的附属调试工具保留
+- 单包不再是约束；目录边界升级为包边界
 
 ---
 
@@ -342,6 +350,16 @@ LLM 自主决定：对哪条消息回复、通过哪个 channel 回复、回复�
 - `AgentEngine` 模块必须通过策略接口抽象 session 创建/恢复/队列逻辑
 - 初始实现提供 `SingleSessionStrategy`，后续可添加 `PerUserSessionStrategy`、`EphemeralSessionStrategy`
 - 记忆系统必须设计为与 session 模型解耦
+
+### Revision 2026-05-30（session 即沙箱边界）
+
+session 策略**同时决定沙箱拓扑**（ADR-018）：**一个 session = 一个沙箱**，沙箱生命周期绑 session 生命周期。
+
+- 单 session → 一个共享沙箱（当前）。群聊多用户在同一沙箱内，用户间隔离靠软件授权层（actor 绑定/信任级，ADR-018），非 OS。
+- per-user session → 每用户一个沙箱，用户间获 OS 级隔离。
+- fork / ephemeral → 各自独立沙箱（后台调度任务、并发子任务用）。
+
+故 `SessionStrategy` 接口需把"沙箱的创建/销毁"纳入 session 生命周期管理。
 
 ---
 
@@ -598,6 +616,10 @@ score(block, query) = cosine_similarity(block.embedding, query)
 - **延迟开销**：每轮对话增加一次 fork LLM 调用
 - **缓解**：可配置轻量/便宜 model 做 fork 遍历，与主 model 可以是不同 provider
 
+#### Revision 2026-05-30（记忆插件化）
+
+原方案隐含"agent 直接调 Pi `session.fork()` 做遍历"。记忆改为完整插件后（ADR-015），**遍历移入插件内部**，插件通过注入的 `ExploreFn` 回调取得 LLM 能力，回调由 retrieval 层用 Pi `session.fork()` 兑现——插件本身不依赖 Pi。遍历沿块的 `relations` 边探索，故 `relations` 字段需保留/重引入 block schema（原 summary.self 锚点已移除，改用 content 摘录）。
+
 ---
 
 ### ADR-009e: 记忆系统 — 生命周期 & 动态权重 (Lifecycle & Weighting)
@@ -845,6 +867,12 @@ aizen-memory search "auth 模块职责边界" \
 - `aizen-memory` CLI 必须支持 `--memory-dir` 多源合并
 - `relations` 中的 `blockId` 引用不受迁移影响（见 ADR-010）
 
+### Revision 2026-05-30（收窄为开发期记忆）
+
+本 ADR 描述的 project/personal/promote 三层与目录约定，**仅适用于"开发期 ADR 记忆"**——即 coding agent 查本仓库架构决策用的工具（`.aizen/project/`、`.aizen/personal/`，归 AGENTS.md 管）。
+
+**产品的"运行期 agent 记忆"不受本 ADR 约束**：它由配置的记忆插件完全自管（本地、云端、任意），引擎层零目录假设（见 ADR-015）。两者是不同的东西，不要混淆。
+
 ---
 
 ## ADR-012: CLI 工具命名
@@ -969,15 +997,228 @@ O(1)，零误判，消除完全相同的重复入库。
 
 ---
 
+## ADR-015: 记忆插件契约 (Memory Provider Contract)
+
+- **Status:** Accepted
+- **Date:** 2026-05-30
+- **Depends on:** ADR-005, ADR-009a, ADR-009d
+
+### Context
+
+记忆系统要做成完整插件机制：默认实现随项目交付，但可被第三方替换，甚至把数据存在云端。前提是一条稳定、不依赖具体 agent 框架（Pi）的契约。
+
+张力：fork 图遍历（ADR-009d）需要 LLM 能力，而 LLM 能力来自 Pi session。若插件直接依赖 Pi，契约就被框架绑死。
+
+### Decision
+
+**定义 `MemoryProvider` 契约（独立包 `@aizen/memory-contract`）。遍历与权重评分在插件内部完成，但插件通过注入的抽象「探索回调」`ExploreFn` 取得 LLM 能力，不依赖 Pi。**
+
+```typescript
+type ExploreFn = (prompt: string) => Promise<string[]>;   // agent 用 Pi session.fork() 兑现
+interface RetrievalContext { explore: ExploreFn; }
+
+interface MemoryProvider {
+  store(input): Promise<{ blockId: string; isNew: boolean }>;
+  retrieve(query: string, ctx: RetrievalContext, opts?): Promise<RetrievedBlock[]>;  // 锚点+遍历+评分
+  search(query: string, opts?): Promise<RetrievedBlock[]>;                            // 仅锚点
+  mark(blockId, action, reason): Promise<void>;
+  stats(): Promise<Stats>;
+}
+```
+
+### Rationale
+
+- 契约零 Pi 依赖 → 换 LLM 框架只动 retrieval 的 `ExploreFn` 实现；换记忆后端只换插件
+- 遍历放插件内（而非 agent 侧）→ 不同插件可有不同遍历策略，云端插件甚至可服务端遍历
+- `ExploreFn` 是插件向外"借"的唯一能力，边界清晰
+
+### Consequences
+
+- 运行期记忆完全由插件自管（存储位置、结构、是否云端），引擎层零目录假设（呼应 ADR-011 修订）
+- app 与所有插件只依赖 contract（ADR-005）
+- 加载：config 指定插件 → 启动时动态 import + 接口校验
+- 遍历依赖块的图的边 → `relations` 字段需保留/重引入 block schema
+
+---
+
+## ADR-016: 定时任务调度与接入主循环
+
+- **Status:** Accepted
+- **Date:** 2026-05-30
+- **Depends on:** ADR-007, ADR-008, ADR-009f
+
+### Context
+
+定时任务（AI insight 提炼、external 抓取、定时提醒）触发后，必须决定如何与正在运行的对话主循环协作：既不污染用户上下文，又能在需要时触达用户。
+
+### Decision
+
+**按"是否要对用户说话"把任务分两类，两条接入路径：**
+
+| 类型 | 例子 | 接入 |
+|------|------|------|
+| 后台维护型 | AI insight 提炼、external 抓取、语义去重 | 在独立 ephemeral session/worker 跑，结果直接写记忆，**不进主队列** |
+| 用户触达型 | 定时提醒、定时播报 | 生成合成系统消息塞进**主入站队列**，agent 在主循环里用 send tool 决定如何触达 |
+
+判据唯一：要不要经渠道"说话"。要说话就必须走主 session（send tool 只在主 agent 上下文）。
+
+### Rationale
+
+- 后台批处理不该挤占用户对话的上下文窗口和处理时机
+- 触达型走合成消息 → 零特例，复用整条消息+记忆+归因通路
+- 后台型正是 ADR-002 "RPC 外包 worker" / ephemeral 策略的用武之地
+
+### Consequences
+
+- 任务配置持久化为文件（如 `tasks.json`）；一期固定周期，cron 后置
+- 合成消息带 `[Scheduler | Task | Time]` 信封，user 角色（见 ADR-017）
+
+---
+
+## ADR-017: 工具装配与消息平面
+
+- **Status:** Accepted
+- **Date:** 2026-05-30
+- **Depends on:** ADR-002, ADR-007
+
+### Context
+
+需明确：怎么给 agent 工具、默认有哪些、以及工具响应与用户消息/定时消息/系统通知/注入记忆之间是什么关系、怎么组织。
+
+### Decision
+
+**工具装配：** 启动时经 Pi `registerTool()` 装配，来源三处——启用渠道各自的 send tool + 记忆工具 + 白名单内的 Pi 内置工具。
+
+**默认工具：** `<channel>_send`、`memory_mark`、`memory_search`。Pi 高权限内置（shell/写文件）默认关，按信任级开（见 ADR-018）。
+
+**两平面一旁路：** agent 的信息分三处组织：
+
+| 种类 | 来源 | 进入方式 | 角色 | 平面 |
+|------|------|----------|------|------|
+| 用户消息 | 渠道 | 入站队列 | user，带渠道信封 | 事件平面 |
+| 定时消息 | scheduler 触达型 | 入站队列（合成） | user，带 Scheduler 信封 | 事件平面 |
+| 系统通知 | 引擎 | steer/system 注入 | system | 事件平面 |
+| 工具响应 | agent 自身调用 | Pi 工具协议（turn 内闭环） | tool，绑 tool_call_id | 动作平面 |
+| 注入记忆 | retrieval | prompt 参数 | 标注的参考块 | 旁路 |
+
+### Rationale
+
+- 工具响应是 agent 自身动作的回执，turn 内闭环，与外部事件（队列）分属两平面，不可混淆
+- 用户/定时消息同走队列同为 user，仅靠信封区分来源与信任级 → 触达零特例
+- 注入记忆是参考非指令，明确分隔（如 `<retrieved-memory>`），防 LLM 当命令执行
+
+### Consequences
+
+- 每个工具调用可带 `on_behalf_of`（见 ADR-018）
+- 系统通知用 system 角色，不被当作"有人说话"
+
+---
+
+## ADR-018: 权限与工具授权 (Tool Authorization)
+
+- **Status:** Experimental
+- **Date:** 2026-05-30
+- **Depends on:** ADR-008, ADR-017
+- **Resolves:** 未决事项 #4（框架层面；细节待迭代）
+- **Research:** `docs/research-tool-permissions.html`（活文档，持续调研）
+
+> **本 ADR 为 Experimental——权限是难题，框架已定但实现细节需反复迭代。** 业界调研、分层框架全貌、分阶段实现、开放问题见上述 research 文档。本条只记已定的决策骨架。
+
+### Context
+
+需要在多用户（含群聊）下控制工具权限：永不让陌生人诱导 agent 用其底层权限。**prompt 不是安全边界**（提示注入可绕过），授权必须代码层强制。
+
+调研业界（Codex / Claude Code / opencode / OpenClaw / Hermes，见末尾对照）得出共识：**主边界是沙箱，不是逐条确认**——没有一个工具会让所有 bash 都确认；沙箱内自动放行，只有逃逸动作（联网、出沙箱、破坏性）才确认。但这些都是**单用户本地 coding agent**，未解决"群聊里陌生人"的归因问题——那部分是我们场景特有的，需自建。
+
+### Decision
+
+**主边界 = 每 session 一个沙箱；沙箱内自动放行，逃逸动作走规则/确认；多用户共享 session 再叠一层软件授权（actor 绑定 + 信任级 + 高危带外确认）。**
+
+#### 1. 每 session 沙箱（主边界，OS 强制）
+
+- 一个 session 的工具执行（bash/文件）被 OS 隔离在它自己的沙箱里，框住对**主机**和**其它 session** 的爆炸半径。
+- **沙箱拓扑由 session 策略决定（ADR-008）**：单 session→一个沙箱；per-user session→每用户一个沙箱（用户间获 OS 级隔离）；fork/ephemeral→各自沙箱。沙箱生命周期绑 session 生命周期。
+- 沙箱不解析命令、只约束能力 → 混淆/组合命令也逃不掉。**沙箱内的命令不逐条确认。**
+
+#### 2. 规则系统（逃逸动作才管）：deny > ask > allow
+
+- 三种判决：**allow**（直接跑）/ **ask**（每次确认）/ **deny**（拦死）。多规则匹配同一命令时按 `deny > ask > allow` 优先级，先匹配先定，deny 最先查。
+- 含**内置只读白名单**（`ls/cat/grep/git 读类`…）默认 allow。
+- 规则按"动作是否逃出沙箱"分类：沙箱内读写→allow；联网/出沙箱/破坏性模式→ask 或 deny。
+
+#### 3. 工具策略在模型调用前移除 schema
+
+被禁工具的定义**不下发给模型**（看不见就调不了）——能力隔离靠"工具不存在"，非靠 prompt 劝阻。
+
+#### 4. 多用户软件授权层（共享 session 内）
+
+OS 沙箱不区分同一 session 的参与者，故群聊场景叠加：
+
+- **信任分级**：`(channel, senderId) → 信任级`，默认拒绝。身份由渠道适配器在代码层从平台认证 ID 盖章，LLM 不可伪造。（对标 Hermes/OpenClaw 的 user authorization / 配对码）
+- **actor 绑定**：工具调用带 `on_behalf_of: userId`，网关校验其为本轮**认证在场参与者** + 信任级足够。
+- **高危带外确认**：高危动作阻塞，向 owner 认证渠道发**代码捕获的原始载荷** + actor + 来源，等真人批准。
+
+#### 5. 兜底与防篡改
+
+- **失败关闭**：无人批准 / 超时 → deny（对标 OpenClaw askFallback、Hermes timeout）。
+- **批准防篡改**：存下批准的计划；命令 / cwd / 引用文件在批准后变化 → 拒（对标 OpenClaw approval mismatch + file drift）。
+- **审计日志**：每次调用记 actor + 放行/拒绝。
+
+### 风险分级（综合沙箱 + 规则 + 多用户）
+
+| 级 | 判定 | 例 |
+|----|------|----|
+| 低 | 沙箱内 + 只读白名单 / allow 规则 | `ls/cat/grep`、`*_send`、`memory_search` |
+| 中 | 沙箱内写 / actor 绑定 + 信任级 | workspace 写、`memory_mark` |
+| 高 | 逃逸动作（联网/出沙箱/破坏性/付费发布）→ ask + owner 带外确认 | 完整 bash 联网、写主机、对外发布 |
+
+### bash 怎么办：靠沙箱分级，不靠解析命令串
+
+`bash` 从 `ls` 到 `rm -rf` 跨度极大，**一律确认会让确认失去意义，逐条解析判风险又不可靠**（管道/重定向/`$()`/混淆都能让"看着安全"的命令变危险）。所以按**执行能力**分，不按字符串：
+
+1. **优先窄口径专用工具**（`read_file`/`list_dir`/`grep_repo`/`git_status`）：风险静态有界，免确认。
+2. **沙箱内 bash**：在每 session 沙箱里跑，安全由沙箱保证 → 沙箱内操作免逐条确认。
+3. **逃逸 bash**（要联网 / 出沙箱 / 触及主机）：ask + 高危带外确认。
+4. **可选严格 allowlist**（锦上添花，非主边界）：只放行锚定且不含 shell 元字符（`; | & > < $` 反引号）的命令；否则落到确认。naive 命令名白名单不安全（`cat x > /etc/passwd`），白名单必须拒绝 shell 组合。
+
+### LLM 在权限里的角色（含修正）
+
+> 修正：早先写"安全判定不用 LLM"过于绝对。调研发现 Codex(Guardian/auto-review，专用模型 `codex-auto-review`) 与 Hermes(smart 模式) **确实用 LLM 判安全**——但都作为**可选的灰色地带裁决层**，不作硬边界。
+
+- **硬边界永远是沙箱（OS/确定性），不是 LLM。**
+- **LLM 可选做"灰色地带审查员"**（仿 Codex Guardian）：只对"已需批准"的越界动作裁决，**只能 gate 不能 grant**（不放大权限/网络/可写域）、**失败关闭**（构建/解析/超时→拒）。判错被沙箱兜住。
+- **身份与批准载荷不经 LLM**：发件人身份由渠道代码层盖章；批准载荷==执行载荷由代码逐字节校验。
+- **LLM 另可用于可读性**：对原始命令生成解读，仅供 owner 参考、非授权依据；为抗注入在隔离 session 生成。
+- 是否启用 LLM 审查员属 P2 迭代项（见 research 文档 §4）。
+
+### 业界对照（调研依据）
+
+| 工具 | 主边界 | 自动放行 | 才确认 | 所有 bash 都确认 |
+|------|--------|----------|--------|:---:|
+| Codex | OS 沙箱（Seatbelt/Landlock）+ 默认禁网 | 沙箱内 workspace 命令 | 出沙箱 / 联网 | ❌ |
+| Claude Code | deny>ask>allow 规则 + 只读内置白名单 | 只读命令 + allow 规则 | ask / 未匹配 | ❌ |
+| opencode | per-pattern allow/ask/deny（可 per-agent） | 配为 allow 的模式 | `*: ask` 兜底 | ❌ |
+| OpenClaw | 工具策略→沙箱→elevated→exec approvals→allowlist；可远程批准 | allowlist / safe bins | 清单 miss（TG/Slack 批准） | ❌ |
+| Hermes | 选隔离后端（容器即边界）+ manual/smart 批准 + 用户 allowlist/配对 | 容器内 / smart 学到的安全命令 | 危险模式扫描命中 | ❌ |
+
+我们 = 业界共识（沙箱主边界 + deny>ask>allow + schema 移除 + 防篡改 + 带外 + 失败关闭）∪ 自有扩展（**每 session 沙箱随策略伸缩** + 群聊内 actor 绑定/信任级）。
+
+### Consequences
+
+- config 定义信任表、各工具风险级、沙箱规则
+- 沙箱实现按部署落地（容器内可用 bubblewrap/Landlock/独立用户等做 session 级隔离），架构上"沙箱边界=session 边界"
+- ADR-008 的 session 策略同时决定沙箱拓扑（见 ADR-008 修订）
+
+---
+
 ## 未决事项 (Open Issues)
 
 以下问题尚未充分讨论：
 
-1. **System Prompt 设计**：如何指导 LLM 在单 session 多用户环境中正确使用 channel tool、归因记忆？
-2. **HTTP/WS Channel 具体协议**：REST vs WebSocket vs SSE？消息格式？
-3. **定时调度器**：cron 表达式？如何持久化任务配置？
-4. **权限与安全**：不同 channel 的信任级别？tool 白名单？
-5. **日志与可观测性**：结构化日志格式？与 Pi 日志的关系？
-6. **错误恢复与自愈**：agent session 崩溃后的自动恢复策略
-7. **Fork 遍历用的 model**：是否可配置轻量模型以降低延迟？
-8. **记忆块过期/淘汰**：是否引入 TTL？还是全凭动态权重自然排序？
+1. **System Prompt 设计**：如何指导 LLM 在共享 session 多用户环境中正确使用 channel tool、归因记忆、填写 `on_behalf_of`？
+2. **HTTP/WS Channel 具体协议**：REST vs WebSocket vs SSE？消息格式？（初步立场：先 HTTP）
+3. **日志与可观测性**：结构化日志格式？与 Pi 日志的关系？
+4. **错误恢复与自愈**：agent session 崩溃后的自动恢复策略（初步立场：进程级守护）
+5. **记忆块过期/淘汰**：是否引入 TTL？还是全凭动态权重自然排序？
+
+> 已解决并归档为正式 ADR：定时调度（ADR-016）、权限与工具授权（ADR-018，原 #4）、fork 遍历 model 可配置（ADR-015）。

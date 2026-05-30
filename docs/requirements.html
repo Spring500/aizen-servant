@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AizenServant 需求</title>
+</head>
+<body>
+<script type="text/x-markdown">
+
+# AizenServant 需求文档
+
+`2026-05-30` · 定义"做什么"与"做到什么算完成"
+
+> 决策的为什么/被否方案见 `ADR.md`；模块边界见 `modules.html`；实施顺序见 `roadmap.html`；宏观运转见 `overview.html`。
+>
+> 标注：**[已实现]** 当前代码已落地 · **[设计]** 有 ADR 决策未实现 · **[推断]** 尚未确认 · **[待定]** 未决策
+
+---
+
+## 1. 产品定位
+
+AizenServant 是一个**长期运行、多渠道接入的聊天助手**。它同时连接多个通信渠道，由 LLM 自主决定对哪条消息、通过哪个渠道、回复什么内容（ADR-007）。差异化在于一套**可替换的记忆系统**：对话之外的一切信息统一为记忆块，每轮对话前检索注入（ADR-009 系列, ADR-015）。
+
+| 特征 | 决策 |
+|------|------|
+| 7x24 常驻服务，守护/重启保持在线 | ADR-002, ADR-003 |
+| 多渠道，跨渠道共享上下文 | ADR-007 |
+| LLM 自主路由，代码层不做 router | ADR-007 |
+| 记忆为完整插件，默认实现可替换、可云端 | ADR-015 |
+| 纯文本持久化，零数据库 | ADR-004 |
+
+!!! Warning 两种"记忆"不要混淆
+    开发期 ADR 记忆（`.aizen/`，coding agent 用，ADR-011）≠ 运行期 agent 记忆（插件自管、可云端，ADR-015）。
+
+---
+
+## 2. 功能需求
+
+### F1 — 多渠道入站 [设计 · ADR-007]
+
+- 每个渠道实现入站适配器，原始消息 → 统一结构 → 入队。统一格式：
+
+```
+[Channel: discord | From: Alice#1234 | MsgID: d-abc123 | Thread: #general]
+消息正文
+```
+
+- **发件人身份由适配器在代码层从平台认证 ID 盖章**（供权限网关用，见 F10）。
+- 队列在 agent 忙时缓冲，空闲时批量拉取。
+- 首批渠道：**[推断]** HTTP 优先（易测、无外部依赖），其后 Discord / Telegram。
+
+### F2 — LLM 自主出站 [设计 · ADR-007]
+
+- 每个渠道注册 `*_send` tool，参数含目标、`reply_to_msg_id`、`content`。
+- LLM 自主决定是否回复、回复哪条、走哪个渠道。**不回复是允许的行为**。
+- send tool 结果回灌给 LLM。
+
+### F3 — Session 模型 [设计 · ADR-008]
+
+- 当前策略：单一长 session 处理所有用户所有消息，**共享上下文（群聊刻意保留）**。
+- 生命周期实现为**可替换策略**，预留：单 session / 每用户 / 每请求 / fork。
+- 队列交互：`agent_end` 触发下一批；工具执行期新消息经 `steer` 注入。
+- 长 session 定期归档/摘要接力防溢出。**[待定]** 接力触发条件。
+
+### F4 — 记忆检索与注入 [部分实现 · ADR-009c, ADR-015]
+
+- 每轮对话前检索新消息，相关块 content 注入本轮 prompt。
+- 管道：embedding → 向量搜锚点 → 图遍历 → 动态权重评分 → Top-K → 注入。
+  - **[已实现]** embedding + 向量搜索 + Top-K + 多源合并
+  - **[设计]** 图遍历（经 ExploreFn）、动态权重评分公式
+- 注入只进 prompt 参数，**不写 session 历史**，下轮自动消失。
+- 记录每轮注入的块，供权重反馈。
+
+### F5 — 记忆写入（对话归档）[设计 · ADR-009e]
+
+- `agent_end` 后抽取本轮 Q&A，创建 `conversation` 块，异步补 embedding。
+- 写入运行期记忆（插件），不自动 promote。
+
+### F6 — 异质数据源入库 [设计 · ADR-009f]
+
+- 支持 `conversation / document / ai_insight / external` 四类（schema [已实现]，入库路径仅 document [设计]）。
+- `document` 文件监听/导入；`external` 指令/定时抓取。content 一律序列化为纯文本。
+
+### F7 — 定时调度 [设计 · ADR-016]
+
+- 周期触发：AI insight 提炼（后台型）、external 抓取、定时提醒（触达型）。
+- 接入主循环按"是否触达用户"分两路（见 overview §4）。
+- 任务配置持久化为文件。**[待定]** cron 表达式（一期固定周期）。
+
+### F8 — 记忆插件机制 [设计 · ADR-015]
+
+- `MemoryProvider` 契约（独立包），当前实现作为默认插件。
+- 插件职责：存储、向量检索、图遍历、权重评分、`mark`、统计。**不依赖 Pi**，经注入的 `ExploreFn` 取 LLM 能力。
+- 加载：config 指定 → 动态 import + 接口校验。运行期记忆由插件自管（含云端）。
+
+### F9 — 配置 [设计]
+
+- 集中配置：渠道凭证、LLM/embedding provider、session 策略、记忆插件选择、**信任表与工具风险级**、调度任务。凭证不入 git。
+
+### F10 — 权限与工具授权 [设计 · ADR-018]
+
+- **主边界 = 每 session 一个沙箱**：工具执行被 OS 隔离，框住对主机和其它 session 的爆炸半径；**沙箱拓扑随 session 策略伸缩**（单/per-user/fork）。沙箱内免逐条确认。
+- **逃逸动作**（联网/出沙箱/破坏性）走 `deny>ask>allow` 规则 + 只读内置白名单。
+- **工具策略在模型调用前移除被禁工具 schema**（看不见就调不了）。
+- **多用户软件层**（OS 沙箱不区分同 session 参与者）：`(channel, senderId)→信任级`（默认拒绝、身份代码层盖章不可伪造）+ 工具带 `on_behalf_of`（网关校验在场+信任级）。
+- **高危带外确认**：向 owner 发代码捕获的原始载荷、超时→拒；批准载荷==执行载荷防篡改（防 drift）。
+- bash 靠沙箱分级，不靠解析命令：窄工具 → 沙箱内 bash 免确认 → 逃逸 bash 确认 → 可选严格 allowlist。
+- 每次工具调用记审计日志。业界共识印证（Codex/Claude Code/opencode/OpenClaw/Hermes：均不逐条确认 bash）。
+
+---
+
+## 3. 非功能需求
+
+| 编号 | 需求 | 决策/说明 |
+|------|------|-----------|
+| NF1 | 纯文本持久化，零数据库 | ADR-004 |
+| NF2 | 容错自愈：session 崩溃可恢复、渠道断连重连 | 进程级守护（ADR-003 Docker restart）；细节 [待定] |
+| NF3 | 可观测：结构化日志，包裹 Pi 事件流 | [待定]（ADR 未决 #3） |
+| NF4 | 性能：检索不显著拖慢响应；遍历可配轻量 model | ADR-009d, ADR-015 |
+| NF5 | 分发：Docker（主）+ npm（次） | ADR-003 |
+| NF6 | 可测试：Vitest 分层 unit/integration/e2e | ADR-006 |
+| NF7 | 隐私隔离：开发期个人记忆永不上 git | ADR-011 |
+| NF8 | 安全：每 session 沙箱为主边界 + 工具授权代码强制，默认无逃逸工具 | ADR-018 |
+
+---
+
+## 4. 明确不做（本阶段边界）
+
+- 多用户鉴权体系、账号系统
+- Web 管理界面 / 可视化
+- 记忆块 TTL / 主动淘汰（暂凭动态权重，ADR 未决 #5）
+- npm 包之外的单文件二进制（ADR-003，无 Docker/Node 需求出现再说）
+- RPC 外包 worker（ADR-002，可选，不阻塞主流程）
+
+---
+
+## 5. 现状待对齐
+
+| # | 现状 | [推断] 建议 |
+|---|------|-------------|
+| 1 | 包名 `aizen-memory` vs 项目 AizenServant | 升级为 workspace 三包，归入 `@aizen/memory-default`（ADR-005） |
+| 2 | `relations`/`summary` 曾移除 | 重引入 `relations`（遍历依赖），`summary` 暂不回 |
+| 3 | 旧根目录 `.md` 文档 | 已转为 `docs/*.html`，删除旧 `.md` |
+
+---
+
+## 6. 验收目标
+
+| # | 标准 | 关联里程碑 |
+|---|------|-----------|
+| 1 | HTTP 发消息 → agent 经 send tool 回复 | M1 |
+| 2 | 多轮对话，第二轮检索到第一轮归档的块并注入 | M2 |
+| 3 | 切换 session 策略只改配置，不改业务代码 | M2 |
+| 4 | 替换记忆插件（默认 ↔ mock）只改配置，行为不变 | M4 |
+| 5 | 定时任务生成 ai_insight 块并被后续检索召回 | M3 |
+| 6 | 陌生人无法诱导 agent 调用高权限工具（网关代码拦截 + 高危带外确认） | M4 |
+
+</script>
+<script src="https://spring500.github.io/enhanced-doc/enhanced-doc.js"></script>
+</body>
+</html>

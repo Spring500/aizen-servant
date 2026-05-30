@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AizenServant 总览</title>
+</head>
+<body>
+<script type="text/x-markdown">
+
+# AizenServant 总览
+
+`2026-05-30` · 项目地基文档 · 一切工作的起点
+
+> 这是**宏观入口**。读完它你应当理解：AizenServant 是什么、整体怎么运转、对话主循环如何驱动、定时任务怎么管理又如何接入主循环、工具与消息如何组织、多用户下权限怎么控、记忆为何是可替换插件。细节下钻见文档地图（末节）。
+
+!!! Note 文档分工
+    本文档（及需求/模块/路线图）只写**当下事实与怎么运转**（what/how），决策的**为什么/被否方案/历史**在 `ADR.md`。非显然处以 `(ADR-NNN)` 链接到决策记录。
+
+!!! Note 文档形态
+    本文档集用 [enhanced-doc](https://github.com/Spring500/enhanced-doc) 渲染：纯 Markdown 写在页面里，浏览器打开自动出图、出表、出目录。无需构建。
+
+---
+
+## 1. 它是什么
+
+AizenServant 是一个**长期运行、多渠道接入的聊天助手**。它同时连接 Discord、Telegram、HTTP 等渠道，由 LLM 自主决定对哪条消息、通过哪个渠道、回复什么。它的差异化在于一套**可替换的记忆系统**：对话之外的一切信息（文档、API 返回、AI 提炼物）统一为记忆块，每轮对话前从中检索相关知识注入上下文。
+
+| 维度 | 取值 | 决策 |
+|------|------|------|
+| 形态 | 7x24 常驻服务（不是 CLI） | ADR-002 |
+| 引擎 | Pi SDK（`@earendil-works/pi-coding-agent`） | ADR-002 |
+| 渠道路由 | 上移到 LLM，代码层不做 router | ADR-007 |
+| 记忆 | 完整插件机制，默认实现随项目交付 | ADR-015 |
+| 持久化 | 纯文本文件，零数据库 | ADR-004 |
+| 运行时 | Node ≥ 22 + pnpm（不用 bun） | ADR-001, ADR-003 |
+| 分发 | Docker（主）+ npm（次） | ADR-003 |
+| 包结构 | pnpm workspace 三包 | ADR-005 |
+
+!!! Warning 关键概念区分：两种"记忆"
+    **开发期 ADR 记忆**（`.aizen/project/`、`.aizen/personal/`）是 coding agent 查本仓库架构决策用的工具，固定本地目录，归 AGENTS.md 管（ADR-011）。
+    **运行期 agent 记忆**是产品运行时真正用的记忆，由配置的**记忆插件完全自管**——本地、云端、任意，引擎层零目录假设（ADR-015）。两者不要混淆。
+
+---
+
+## 2. 系统全景
+
+:::mermaid
+flowchart TB
+  CFG["config 配置<br/>凭证 / 策略 / 插件选择 / 信任表 / 任务"]
+
+  subgraph CH["channels 渠道层（极薄）"]
+    HTTP["HTTP"]
+    DC["Discord"]
+    TG["Telegram"]
+  end
+
+  subgraph CORE["core 引擎"]
+    Q["入站消息队列"]
+    ENG["AgentEngine 主循环"]
+    STR["SessionStrategy 可替换策略"]
+    GW["工具授权网关"]
+  end
+
+  PI[("Pi Session")]
+
+  subgraph RET["retrieval 检索编排（agent 侧）"]
+    EXP["ExploreFn 构造与注入"]
+  end
+
+  subgraph MEM["memory 记忆插件 · 可替换 · 不依赖 Pi"]
+    PROV["MemoryProvider 契约"]
+    DEF["默认实现：文件存储+向量检索"]
+  end
+
+  SCH["scheduler 定时器"]
+
+  CH -->|"入站统一格式(带认证身份)"| Q
+  Q --> ENG
+  ENG --> STR --> PI
+  ENG --> GW
+  GW -->|"放行/拒绝/带外确认"| PI
+  ENG -->|"每轮检索"| RET --> PROV
+  RET -.->|"LLM 探索回调(Pi fork)"| PI
+  ENG -->|"send tool 出站"| CH
+  ENG -->|"agent_end 归档"| PROV
+  SCH -->|"后台维护型：直接写记忆"| PROV
+  SCH -->|"用户触达型：合成消息入队"| Q
+  PROV --- DEF
+  CFG -.-> ENG
+  CFG -.-> MEM
+  CFG -.-> CH
+  CFG -.-> SCH
+:::
+
+**依赖铁律：** `core/retrieval` 依赖 Pi；`memory` 插件**不依赖 Pi、不依赖 core**，只依赖记忆契约。需要 LLM 能力时（图遍历），由 `retrieval` 把抽象「探索回调」注入插件——回调内部用 Pi `session.fork()` 兑现。换 LLM 框架只动 retrieval，换记忆后端只换插件，互不牵连。
+
+---
+
+## 3. 对话主循环
+
+主循环是整个 agent 的心脏：一个**单一串行循环**——消息进队列，引擎空闲时批量取出，检索注入，交给 LLM，LLM 经授权网关用工具回复，结束后归档，回到开头。
+
+### 3.1 状态流转
+
+:::mermaid
+stateDiagram-v2
+  [*] --> 空闲
+  空闲 --> 空闲: 队列空 / 等待入站事件
+  空闲 --> 拉取批次: 队列非空 且 session 空闲
+  拉取批次 --> 检索注入: drain N 条消息
+  检索注入 --> 思考与回复: 注入记忆块到本轮 prompt
+  思考与回复 --> 思考与回复: 工具执行期新消息 → steer 注入
+  思考与回复 --> 归档: agent_end
+  归档 --> 空闲: 写 conversation 块 + 记录注入块
+:::
+
+### 3.2 一轮的时序
+
+:::mermaid
+sequenceDiagram
+  autonumber
+  participant CH as 渠道
+  participant Q as 入站队列
+  participant E as AgentEngine
+  participant R as retrieval
+  participant M as memory 插件
+  participant G as 授权网关
+  participant S as Pi Session
+
+  CH->>Q: 入站消息（统一格式，带认证身份）
+  E->>S: waitForIdle（确保互斥）
+  E->>Q: drain 一批
+  E->>R: retrieve(批次, explore 回调)
+  R->>M: search 向量锚点
+  M-->>R: 锚点块
+  R->>S: ExploreFn → session.fork() 沿图遍历
+  S-->>R: 选中的 blockId[]
+  R->>M: 取回全文 + 动态权重评分
+  M-->>R: Top-K 注入块
+  R-->>E: injectedBlocks
+  E->>S: prompt(注入块 + 批次消息)
+  S->>G: 工具调用(含 on_behalf_of)
+  G->>S: 放行 / 拒绝 / 带外确认后放行
+  S->>CH: 经 *_send tool 回复
+  CH-->>S: 工具执行期新消息 → steer 注入
+  S-->>E: agent_end
+  E->>M: store(本轮 Q&A → conversation 块)
+  E->>E: 记录本轮注入块（供权重反馈）
+:::
+
+### 3.3 关键机制
+
+| 机制 | 说明 | Pi 原语 |
+|------|------|---------|
+| 串行互斥 | `prompt()` 同时只能一个，队列天然串行化所有渠道消息 | `waitForIdle` |
+| 批量拉取 | 空闲时一次取多条，跨渠道消息进同一上下文 | `prompt(messages[])` |
+| 执行期插话 | 工具跑时来的新消息，在工具完成后、下一轮 LLM 前注入 | `steer()` |
+| 归档触发 | 一轮结束抽取 Q&A 落库 | `agent_end` 事件 |
+| 注入即焚 | 记忆只进 prompt 参数，不写 session 历史，下轮自动消失，须重新检索 | — |
+
+!!! Tip 为什么注入不写历史
+    记忆块若写进 session JSONL，会永久占用上下文窗口且无法随权重更新而变化。只进 prompt 参数 → 每轮重新检索 → 始终是"当下最相关"的记忆，且窗口可控（ADR-009c）。
+
+---
+
+## 4. 定时任务管理与接入主循环
+
+定时任务（周期提炼 AI insight、定时抓取外部数据、定时提醒/播报）由 `scheduler` 管理。接入主循环的判据只有一个：**这个任务要不要"说话给用户"？**（ADR-016）
+
+任务定义持久化为文件（如 `tasks.json`），每条含 `id / schedule / kind / params`。一期固定周期，cron 后置。
+
+:::mermaid
+flowchart LR
+  T["tasks.json"] --> SCH{"scheduler 到点触发"}
+  SCH -->|"后台维护型"| W["临时 ephemeral session / worker"]
+  W --> MEM[("memory 插件")]
+  SCH -->|"用户触达型"| SYN["合成系统消息"]
+  SYN --> Q["主入站队列"]
+  Q --> ENG["主循环"]
+  ENG -->|"send tool"| OUT["渠道"]
+:::
+
+| 类型 | 例子 | 接入方式 | 为什么 |
+|------|------|----------|--------|
+| **后台维护型** | AI insight 提炼、external 抓取、语义去重 | 独立临时 session/worker 跑，**直接写记忆**，不进主队列 | 批处理不该挤占用户对话的上下文窗口和处理时机 |
+| **用户触达型** | 定时提醒、定时播报 | 生成**合成系统消息**塞进**主入站队列**，agent 在主循环里决定如何触达 | 凡要经渠道"说话"，必须走主 session——send tool 只在主 agent 上下文 |
+
+后台维护型完全不碰主循环；用户触达型复用整条消息通路，零特例。
+
+---
+
+## 5. 工具与消息平面
+
+### 5.1 怎么给 agent 工具（ADR-017）
+
+启动时经 Pi `registerTool()` 装配，来源三处：**启用渠道各自的 send tool + 记忆工具 + 白名单内的 Pi 内置工具**。
+
+默认工具：`<channel>_send`、`memory_mark`、`memory_search`。Pi 高权限内置（shell/写文件）**默认关**，按信任级开（见 §6）。
+
+### 5.2 五类信息：两平面一旁路
+
+agent 的世界分**两个平面 + 一条旁路**，不可混为一谈：
+
+:::mermaid
+flowchart TB
+  subgraph EVT["事件平面（入站队列，串行批处理）"]
+    UM["用户消息<br/>user · 渠道信封"]
+    SM["定时消息<br/>user · Scheduler 信封"]
+    SN["系统通知<br/>system"]
+  end
+  subgraph ACT["动作平面（turn 内，Pi 闭环）"]
+    TC["工具调用"] --> TR["工具响应<br/>tool · 绑 tool_call_id"]
+  end
+  BYP["旁路：注入记忆<br/>prompt 参数 · 参考非指令"]
+  EVT --> LLM["LLM 一轮"]
+  BYP -.-> LLM
+  LLM --> ACT
+  ACT --> LLM
+:::
+
+| 种类 | 来源 | 进入方式 | 角色 | 持久化 |
+|------|------|----------|------|--------|
+| 用户消息 | 渠道 | 入站队列 | user，带渠道信封 | 归档为 conversation 块 |
+| 定时消息 | scheduler 触达型 | 入站队列（合成） | user，带 `[Scheduler]` 信封 | 同上 |
+| 系统通知 | 引擎（工具失败/队列积压/会话接力） | steer / system 注入 | system | 视情况 |
+| **工具响应** | **agent 自身调用** | **Pi 工具协议（turn 内闭环）** | tool，绑 tool_call_id | 随 session 历史 |
+| 注入记忆 | retrieval | prompt 参数 | 标注的参考块 | 否（注入即焚） |
+
+!!! Warning 不要混淆平面
+    **工具响应不走队列**——它是 agent 自身动作的回执，turn 内闭环，跟"外部事件"（用户/定时消息）是两个平面。
+    **用户消息 vs 定时消息**只靠信封区分来源与信任级，同为 user 角色。
+    **注入记忆是参考资料不是指令**，用 `<retrieved-memory>` 之类明确分隔，防 LLM 当命令执行。
+
+---
+
+## 6. 多用户权限（沙箱主边界 + 软件授权）
+
+!!! Warning 此区为持续调研中
+    权限是难题，框架已定、实现分阶段、细节待迭代。完整业界调研、分层框架、分阶段实现、开放问题见 **`research-tool-permissions.html`**；决策见 ADR-018（Experimental）。
+
+业界共识（Codex/Claude Code/opencode/OpenClaw/Hermes）：**主边界是沙箱，不是逐条确认**——没人会让所有 bash 都确认；沙箱内自动放行，只有逃逸动作才管。**prompt 不是安全边界**，授权代码层强制（ADR-018）。
+
+**主边界 = 每 session 一个沙箱**：一个 session 的工具执行被 OS 隔离，框住对主机和其它 session 的爆炸半径。**沙箱拓扑随 session 策略伸缩**（ADR-008 修订）：单 session→一个沙箱；per-user→每用户一个沙箱；fork/ephemeral→各自沙箱。
+
+:::mermaid
+flowchart TB
+  TC["LLM 请求工具调用<br/>带 on_behalf_of"] --> SCHEMA{"工具策略<br/>(模型调用前已移除被禁工具 schema)"}
+  SCHEMA --> SB{"动作在 session 沙箱内?"}
+  SB -->|"是(读/写沙箱内)"| RULES{"deny>ask>allow 规则<br/>+ 只读白名单"}
+  RULES -->|allow| RUN["执行"]
+  RULES -->|ask| OOB
+  RULES -->|deny| DENY["拒绝"]
+  SB -->|"否(联网/出沙箱/破坏性)"| MU{"actor 在场 + 信任级足够?"}
+  MU -->|否| DENY
+  MU -->|是| OOB{"高危? owner 带外确认<br/>(原始载荷, 超时→拒)"}
+  OOB -->|批准| RUN
+  OOB -->|拒绝/超时| DENY
+:::
+
+| 层 | 机制 | 业界对标 |
+|----|------|----------|
+| 每 session 沙箱 | OS 隔离工具执行，框住爆炸半径；沙箱内免逐条确认 | Codex 沙箱、Hermes 容器后端 |
+| deny>ask>allow 规则 | 逃逸动作走规则；含只读内置白名单 | Claude Code、opencode |
+| schema 移除 | 被禁工具不下发给模型，看不见就调不了 | OpenClaw 工具策略、Claude Code |
+| 多用户软件层 | `on_behalf_of` + per-sender 信任级（OS 沙箱不区分同 session 参与者） | 我们特有（群聊场景） |
+| 高危带外确认 | 向 owner 发原始载荷、超时→拒；批准载荷==执行载荷防篡改 | OpenClaw 远程批准+防 drift、Hermes |
+
+!!! Note deny > ask > allow 是什么
+    三种判决：**allow** 直接跑 / **ask** 每次确认 / **deny** 拦死。多规则匹配同一命令时按此优先级，deny 先查、先匹配先定。例：`allow Bash(git *)` + `deny Bash(git push *)` → `git commit` 跑、`git push` 拒。
+
+!!! Note bash 靠沙箱分级，不靠解析命令
+    逐条解析 shell 判风险不可靠（管道/重定向/`$()`/混淆）。优先窄口径专用工具（`read_file`/`list_dir`）→ 沙箱内 bash 免确认 → 逃逸 bash（联网/出沙箱）才确认 → 可选严格 allowlist（拒绝含 shell 元字符者）。详见 ADR-018。
+
+---
+
+## 7. 记忆插件边界
+
+记忆做成**完整插件**：app 和所有插件都只依赖一个极薄的**契约包**，彼此不依赖。云端记忆插件就是另一个实现契约的包，对本地目录零假设（ADR-005, ADR-015）。
+
+:::mermaid
+flowchart TB
+  C["@aizen/memory-contract<br/>MemoryProvider · ExploreFn · 数据类型<br/>(零运行时依赖，极稳定)"]
+  D["@aizen/memory-default<br/>文件存储默认插件"]
+  S["@aizen/servant<br/>主应用 core/channels/retrieval/scheduler"]
+  X["第三方/云端插件"]
+  D -->|implements| C
+  X -->|implements| C
+  S -->|depends| C
+  S -.->|运行时按配置加载| D
+  S -.->|或| X
+:::
+
+```typescript
+interface MemoryProvider {
+  store(input): Promise<{ blockId, isNew }>;
+  retrieve(query, ctx: { explore: ExploreFn }, opts?): Promise<RetrievedBlock[]>; // 含图遍历+评分
+  search(query, opts?): Promise<RetrievedBlock[]>;                                // 仅锚点
+  mark(blockId, action, reason): Promise<void>;
+  stats(): Promise<Stats>;
+}
+type ExploreFn = (prompt: string) => Promise<string[]>; // agent 用 Pi fork 兑现
+```
+
+!!! Warning 遍历依赖图的边
+    fork 图遍历需要块之间的 `relations`（prevId/nextId/related），该字段曾被移除，重新启用遍历前必须加回 block schema——这是"插件内遍历"的直接前提（ADR-009d 修订）。
+
+---
+
+## 8. 当前进度
+
+:::mermaid
+flowchart LR
+  subgraph DONE["✅ 已交付（默认插件部分）"]
+    A1["块模型+存储+脏检测"]
+    A2["Ollama embedding"]
+    A3["向量检索+多源合并"]
+    A4["哈希去重+CLI"]
+  end
+  subgraph TODO["⬜ 待建"]
+    B1["MemoryProvider 契约"]
+    B2["图遍历+动态权重"]
+    B3["agent 引擎+渠道+授权网关"]
+    B4["scheduler+异质源"]
+    B5["Docker 分发"]
+  end
+  DONE --> TODO
+:::
+
+并行两条线、里程碑 M1–M4 见路线图。
+
+---
+
+## 9. 文档地图
+
+| 文档 | 作用 |
+|------|------|
+| **总览**（本文 `overview.html`） | 宏观入口：定位、主循环、调度、工具/消息、权限、插件边界 |
+| 需求 `requirements.html` | 功能/非功能需求、不做边界、验收目标 |
+| 模块 `modules.html` | 模块职责、依赖方向、MemoryProvider 契约、数据流、workspace 布局 |
+| 路线图 `roadmap.html` | A=agent 骨架 / B=记忆补完 两线、里程碑 |
+| 调研 `research-tool-permissions.html` | **活文档**：工具权限业界调研 + 分层框架 + 分阶段实现 + 开放问题 |
+| `ADR.md` | 全部架构决策记录（why/被否方案/历史） |
+
+</script>
+<script src="https://spring500.github.io/enhanced-doc/enhanced-doc.js"></script>
+</body>
+</html>

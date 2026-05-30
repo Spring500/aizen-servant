@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AizenServant 模块划分</title>
+</head>
+<body>
+<script type="text/x-markdown">
+
+# AizenServant 模块划分
+
+`2026-05-30` · 模块边界、依赖方向、契约
+
+> 需求见 `requirements.html`，决策见 `ADR.md`，宏观运转见 `overview.html`。
+> 标注：**[已实现]** / **[设计]** / **[推断]**
+
+---
+
+## 1. Workspace 布局（ADR-005）
+
+```
+AizenServant/                      ← pnpm workspace 根（私有）
+├── packages/
+│   ├── memory-contract/           ← @aizen/memory-contract
+│   ├── memory-default/            ← @aizen/memory-default（现 src/memory/* 演进）
+│   └── servant/                   ← @aizen/servant（主应用）
+└── （第三方/云端插件 = 另一个只依赖 contract 的包）
+```
+
+:::mermaid
+flowchart TB
+  C["@aizen/memory-contract<br/>接口·类型 零依赖"]
+  D["@aizen/memory-default<br/>文件存储插件"]
+  S["@aizen/servant<br/>主应用"]
+  X["第三方/云端插件"]
+  D -->|implements| C
+  X -->|implements| C
+  S -->|depends| C
+  S -.->|运行时加载| D
+  S -.->|或| X
+:::
+
+---
+
+## 2. 分层总览
+
+:::mermaid
+flowchart TB
+  CFG["config 配置"]
+  subgraph CH["channels 渠道层（极薄）"]
+    direction LR
+    HTTP["HTTP"]
+    DC["Discord"]
+    TG["Telegram"]
+  end
+  subgraph CORE["core 引擎"]
+    direction LR
+    Q["入站队列"]
+    ENG["AgentEngine"]
+    STR["SessionStrategy"]
+    GW["授权网关"]
+  end
+  PI[("Pi Session")]
+  RET["retrieval 检索编排"]
+  TOOLS["tools 非渠道工具"]
+  subgraph MEM["memory 记忆插件（不依赖 Pi/core）"]
+    PROV["MemoryProvider"]
+  end
+  SCH["scheduler"]
+  OBS["observability"]
+
+  CH --> Q --> ENG --> STR --> PI
+  ENG --> GW --> PI
+  ENG --> RET --> PROV
+  RET -.->|ExploreFn| PI
+  ENG --> TOOLS
+  ENG -->|send tool| CH
+  ENG -->|归档| PROV
+  SCH --> PROV
+  SCH --> Q
+  CFG -.-> CORE
+  CFG -.-> MEM
+  CFG -.-> CH
+  CFG -.-> SCH
+:::
+
+**依赖铁律：**
+
+- `core/retrieval` 依赖 Pi；`memory` 插件**不依赖 Pi、不依赖 core**，只依赖 contract。
+- `retrieval` 是桥：知道 Pi（提供 ExploreFn）+ 知道 `MemoryProvider` 接口，但不知道具体插件实现。
+- `channels` 只依赖 core 的队列与 tool 注册接口，渠道间互不依赖。
+
+---
+
+## 3. 模块职责
+
+| 模块 | 职责 | 状态 |
+|------|------|------|
+| `config` | 集中加载配置（凭证/策略/插件/信任表/任务），zod 校验 | [设计] |
+| `core` | AgentEngine 主循环、消息队列、SessionStrategy、授权网关 | [设计] |
+| `channels` | 每渠道：入站适配器（盖认证身份）+ `*_send` tool | [设计] |
+| `tools` | 非渠道工具：`memory_mark`、`memory_search` 等 | [设计] |
+| `retrieval` | 编排检索：构造 ExploreFn（Pi fork）→ 调插件 retrieve → 注入 | [设计] |
+| `memory` | MemoryProvider 契约 + 默认实现（store/embedder/retriever/traversal/dedup） | [部分实现] |
+| `scheduler` | 定时任务，后台型直写记忆 / 触达型入队 | [设计] |
+| `observability` | 结构化日志，包裹 Pi 事件流 | [设计] |
+
+### 3.1 core 细节
+
+- **AgentEngine**：管理 Pi session、消息队列、`agent_end`/`steer` 事件循环（ADR-008）。
+- **SessionStrategy**（策略接口）：抽象 session 创建/恢复/队列归属，**并管理 session 的沙箱生命周期（一个 session = 一个沙箱）**。默认 `SingleSessionStrategy`（一个共享沙箱），预留 PerUser（每用户一沙箱）/Ephemeral/Fork（各自沙箱）。
+- **授权网关**：每个工具调用前的代码级拦截（ADR-018）。主边界是**每 session 沙箱**——沙箱内操作免逐条确认；逃逸动作（联网/出沙箱/破坏性）走 `deny>ask>allow` 规则 + 高危 owner 带外确认；多用户共享 session 内叠 `on_behalf_of` + 信任级。被禁工具在模型调用前从 schema 移除。
+
+### 3.2 memory 默认实现与现有代码映射
+
+| 现有文件 | 演进 |
+|----------|------|
+| `block.ts` | 保留 schema；**重引入 `relations`**（遍历依赖图的边） |
+| `store.ts` | 保留（文件存储 + `.vec` + 脏检测） |
+| `embedder.ts` | 保留（Ollama，接口已抽象，可换 OpenAI） |
+| `retriever.ts` | 补动态权重评分；新增 `traversal`（经 ExploreFn） |
+| `cli.ts` | 保留为 memory-default 调试入口 |
+| `scripts/import-adr.ts` | 保留 |
+
+---
+
+## 4. 插件契约 MemoryProvider（ADR-015）
+
+遍历放插件内，但插件经注入的 `ExploreFn` 取 LLM 能力，**零 Pi 依赖**。
+
+```typescript
+type ExploreFn = (prompt: string) => Promise<string[]>; // agent 用 Pi session.fork() 兑现
+interface RetrievalContext { explore: ExploreFn; }
+
+interface RetrievedBlock {
+  blockId: string; content: string; type: string; score: number; source: string;
+}
+
+interface MemoryProvider {
+  store(input: CreateBlockInput): Promise<{ blockId: string; isNew: boolean }>;
+  retrieve(query: string, ctx: RetrievalContext, opts?: { k?: number }): Promise<RetrievedBlock[]>;
+  search(query: string, opts?: { k?: number }): Promise<RetrievedBlock[]>;
+  mark(blockId: string, action: "flag_misleading" | "flag_outdated" | "flag_invalid", reason: string): Promise<void>;
+  stats(): Promise<{ blockCount: number; indexedCount: number }>;
+}
+```
+
+- `retrieve`（含遍历）与 `search`（仅锚点）分开，编排层按需选用。
+- 接口零 Pi 依赖：换 LLM 框架只影响 retrieval 如何兑现 `ExploreFn`。
+- 加载：config 指定插件 → 动态 import → 校验导出符合 `MemoryProvider`。
+
+---
+
+## 5. 工具装配与消息平面（ADR-017）
+
+**装配：** 启动时 `registerTool()`，来源 = 启用渠道 send tool + 记忆工具 + 白名单 Pi 内置。默认 = `*_send` / `memory_mark` / `memory_search`，高权限内置默认关。
+
+**两平面一旁路：**
+
+| 种类 | 进入方式 | 角色 | 平面 |
+|------|----------|------|------|
+| 用户消息 / 定时消息 | 入站队列 | user（信封区分） | 事件 |
+| 系统通知 | steer/system | system | 事件 |
+| 工具响应 | Pi 工具协议 turn 内 | tool | 动作 |
+| 注入记忆 | prompt 参数 | 参考块 | 旁路 |
+
+工具响应不走队列；注入记忆是参考非指令。
+
+---
+
+## 6. 主数据流
+
+:::mermaid
+sequenceDiagram
+  autonumber
+  participant CH as 渠道
+  participant Q as 队列
+  participant E as AgentEngine
+  participant R as retrieval
+  participant M as memory
+  participant G as 网关
+  participant S as Pi
+  CH->>Q: 入站(带认证身份)
+  E->>Q: 空闲时 drain 一批
+  E->>R: retrieve(批次, explore)
+  R->>M: search 锚点
+  R->>S: ExploreFn 遍历(fork)
+  R->>M: 评分+取全文
+  R-->>E: 注入块
+  E->>S: prompt(注入+消息)
+  S->>G: 工具调用(on_behalf_of)
+  G-->>S: 放行/拒绝/确认
+  S->>CH: send tool 回复
+  S-->>E: agent_end
+  E->>M: store(Q&A)
+:::
+
+定时支线：`scheduler` 后台型 → 临时 session 提炼 → `store(ai_insight)`；触达型 → 合成消息入队。
+
+---
+
+## 7. 待建模块清单
+
+| 新建 | 包/目录 |
+|------|---------|
+| MemoryProvider 接口 | `packages/memory-contract/` |
+| 默认插件 implements | `packages/memory-default/`（迁移现 `src/memory/`） |
+| core / channels / retrieval / scheduler / config / tools | `packages/servant/src/` |
+
+</script>
+<script src="https://spring500.github.io/enhanced-doc/enhanced-doc.js"></script>
+</body>
+</html>
